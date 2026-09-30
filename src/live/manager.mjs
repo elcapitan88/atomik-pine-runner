@@ -37,12 +37,17 @@ export class LiveManager {
     this.feed.start();
     this.tickTimer = setInterval(() => { const now = Date.now(); for (const a of this.aggregators.values()) a.tick(now); }, 5_000);
     this.syncTimer = setInterval(() => this.sync(), this.config.liveSyncSeconds * 1000);
+    // Heartbeat: re-send each session's last state. Tradesocket only relays
+    // pushes (a chart's catch-up request is dropped on Tradovate connections),
+    // so without this a chart opened between bar closes stays empty.
+    this.heartbeatTimer = setInterval(() => this.#heartbeat(), Math.max(15, this.config.liveHeartbeatSeconds || 60) * 1000);
     await this.sync();
   }
 
   async stop() {
     clearInterval(this.syncTimer);
     clearInterval(this.tickTimer);
+    clearInterval(this.heartbeatTimer);
     clearTimeout(this.reloadTimer);
     this.feed.stop();
     await this.bus.stop();
@@ -56,6 +61,13 @@ export class LiveManager {
       lastSync: this.lastSync,
       lastSyncError: this.lastSyncError,
     };
+  }
+
+  async #heartbeat() {
+    for (const s of this.sessions.values()) {
+      if (!s.lastPayload) continue;
+      await this.bus.publishState({ ...s.lastPayload, ts: new Date().toISOString() });
+    }
   }
 
   #reloadSoon() {
@@ -88,7 +100,7 @@ export class LiveManager {
       for (const [key, it] of wanted) {
         const cur = this.sessions.get(key);
         if (cur && cur.source === it.source && cur.timeframe === it.timeframe && cur.strategyKey === it.strategy_key) continue;
-        const s = { key, id: it.strategy_code_id, strategyKey: it.strategy_key, symbol: it.symbol, timeframe: it.timeframe, seconds: atomikToSeconds(it.timeframe), source: it.source, symbolInfo: it.symbol_info || null, bars: [], warmed: false, runs: 0, lastRunMs: null, lastError: null, lastHash: null, running: false, pending: false };
+        const s = { key, id: it.strategy_code_id, strategyKey: it.strategy_key, symbol: it.symbol, timeframe: it.timeframe, seconds: atomikToSeconds(it.timeframe), source: it.source, symbolInfo: it.symbol_info || null, bars: [], warmed: false, runs: 0, lastRunMs: null, lastError: null, lastHash: null, lastPayload: null, running: false, pending: false };
         this.sessions.set(key, s);
         this.log.info?.(`live: ${cur ? 'updated' : 'added'} ${key} (${it.symbol} ${it.timeframe})`);
         this.#warm(s).catch((err) => { s.lastError = `warmup: ${err.message}`; this.log.warn?.(`live: warmup failed for ${key}: ${err.message}`); });
@@ -161,6 +173,7 @@ export class LiveManager {
         s.lastError = null;
         const payload = stateFrom(res.live, { strategyKey: s.strategyKey, symbol: s.symbol });
         const hash = stateHash(payload);
+        s.lastPayload = payload;
         if (hash !== s.lastHash) {
           s.lastHash = hash;
           await this.bus.publishState(payload);

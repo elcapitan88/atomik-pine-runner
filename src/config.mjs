@@ -37,6 +37,9 @@ export const config = {
   liveWarmupBars: int('PINE_LIVE_WARMUP_BARS', 1500),
   liveSyncSeconds: int('PINE_LIVE_SYNC_SECONDS', 30),
   liveRunTimeoutMs: int('PINE_LIVE_RUN_TIMEOUT_MS', 20_000),
+  // Re-publish unchanged state this often so a chart opened between bar closes
+  // catches up even when its own catch-up request is lost.
+  liveHeartbeatSeconds: int('PINE_LIVE_HEARTBEAT_SECONDS', 60),
   get isProduction() {
     return this.environment === 'production';
   },
