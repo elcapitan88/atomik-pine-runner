@@ -17,7 +17,8 @@
     "fastify": "^5.2.0",
     "isolated-vm": "^7.0.1",
     "pg": "^8.13.1",
-    "pinets": "0.10.0"
+    "pinets": "0.10.0",
+    "redis": "^4.7.1"
   },
   "devDependencies": {
     "vitest": "^3.0.5"

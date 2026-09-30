@@ -14,11 +14,24 @@ const app = Fastify({ logger: true, bodyLimit: 2 * 1024 * 1024 });
 const pool = new WorkerPool({ size: config.workerCount, log: app.log });
 warehouse.connect(config.timescaleUrl);
 
+// Live chart indicators need the DataHub feed, Redis and the backend; without
+// all three the service is backtest-only.
+const liveConfigured = config.liveEnabled && config.datahubWsUrl && config.datahubApiKey && config.redisUrl;
+let live = null;
+if (liveConfigured) {
+  const { LiveManager } = await import('./live/manager.mjs');
+  live = new LiveManager({ config, pool, log: app.log });
+  live.start().catch((err) => app.log.error(`live manager failed to start: ${err.message}`));
+} else {
+  app.log.warn('live chart indicators disabled (DATAHUB_WS_URL, DATAHUB_API_KEY, REDIS_URL needed)');
+}
+
 app.get('/health', async () => ({
   ok: true,
   runtime: 'pinets',
   warehouse: await warehouse.ping(),
   pool: pool.stats,
+  live: live ? live.stats : null,
 }));
 
 function checkSource(source) {
@@ -67,6 +80,7 @@ async function shutdown(signal) {
   shuttingDown = true;
   app.log.info(`${signal}: shutting down`);
   await app.close();
+  if (live) await live.stop();
   await pool.close();
   await warehouse.close();
   // No process.exit(): let killed isolates finish tearing down (a hard exit

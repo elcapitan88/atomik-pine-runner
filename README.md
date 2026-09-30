@@ -15,6 +15,10 @@ interact with.
 - `POST /v1/backtest` — runs a `strategy()` script over a date range of warehouse bars and returns
   trades, metrics, an equity curve and chart output, in the same shape as Atomik's Python backtests.
 - `GET /health`
+- Live chart indicators (`src/live/`): every Pine script the backend reports as "shown on a chart"
+  gets a session that warms up from the warehouse, aggregates DataHub trades into bars, re-runs the
+  script on each closed bar, and publishes its plots, markers, boxes and levels to Redis
+  (`strategy_state:{strategy}:{symbol}`), where Atomik's WebSocket relay forwards them to the chart.
 
 Both `/v1` routes need `X-API-Key: <PINE_RUNNER_KEY>`. The service is reached only over Fly's private
 network; it never faces the internet.
@@ -52,6 +56,10 @@ HTTP request ─▶ server.mjs (auth, validation) ─▶ pool.mjs ─▶ worker.
 | `PINE_COMPILE_TIMEOUT_MS` | `15000` | wall clock for `/v1/compile` |
 | `PINE_BACKTEST_TIMEOUT_MS` | `90000` | wall clock for `/v1/backtest` |
 | `PINE_COMPILE_BARS` | `500` | bars used by the compile dry-run |
+| `DATAHUB_WS_URL` / `DATAHUB_API_KEY` | — | DataHub trade feed (live indicators) |
+| `REDIS_URL` | — | where chart state is published (live indicators) |
+| `BACKEND_INTERNAL_URL` | `http://atomik-backend.internal:8000` | lists the scripts to run live |
+| `PINE_LIVE_WARMUP_BARS` | `1500` | history each live session keeps |
 
 ## Development
 

@@ -6,7 +6,7 @@ import { runPine } from './sandbox.mjs';
 import { toBacktestPayload } from './translate.mjs';
 import * as warehouse from './warehouse.mjs';
 import { tickerToRoot } from './symbols.mjs';
-import { atomikToPine, pineToSeconds, secondsToAtomik } from './timeframes.mjs';
+import { atomikToPine, atomikToSeconds, pineToSeconds, secondsToAtomik } from './timeframes.mjs';
 
 warehouse.connect(config.timescaleUrl);
 
@@ -112,6 +112,40 @@ async function backtest(job) {
   return { ok: true, backtest: { ...toBacktestPayload(res), kind: res.kind, title: res.title } };
 }
 
+// Live chart run: the primary series comes from the session's own bar history
+// (passed in), so a live bar that the warehouse hasn't stored yet is still
+// seen; request.security for other timeframes reads the warehouse.
+async function liveRun(job) {
+  const pineTf = atomikToPine(job.timeframe);
+  if (!pineTf) return { ok: false, status: 400, detail: `Unsupported timeframe '${job.timeframe}'.` };
+  const primary = job.bars || [];
+  const wantSeconds = atomikToSeconds(job.timeframe);
+  const provider = async (tickerId, tf, limit, sDate, eDate) => {
+    const root = tickerToRoot(tickerId);
+    if (root === job.symbol && pineToSeconds(tf) === wantSeconds) {
+      let bars = primary;
+      if (sDate != null) bars = bars.filter((b) => b.openTime >= sDate);
+      if (eDate != null) bars = bars.filter((b) => b.openTime <= eDate);
+      if (limit) bars = bars.slice(-limit);
+      return bars;
+    }
+    return fetchBars(tickerId, tf, limit, sDate, eDate);
+  };
+  const res = await runPine({
+    source: job.source,
+    tickerId: job.symbol,
+    timeframe: pineTf,
+    limit: primary.length,
+    symbolInfo: symbolInfoFor(job.symbol, job.symbol_info),
+    fetchBars: provider,
+    timeoutMs: config.liveRunTimeoutMs,
+    memoryMb: config.isolateMemoryMb,
+    maxPlotPoints: 400,
+  });
+  if (!res.ok) return { ok: false, status: 400, detail: res.reason === 'data' ? res.error : `Script error: ${cleanError(res.error)}` };
+  return { ok: true, live: { kind: res.kind, title: res.title, bars: res.bars, lastTime: res.lastTime, plots: res.plots, shapes: res.shapes, drawings: res.drawings, ms: res.ms } };
+}
+
 function defaultSymbolInfo(symbol) {
   return {
     ticker: symbol, tickerid: symbol, root: symbol, prefix: '', type: 'futures', description: symbol,
@@ -132,7 +166,7 @@ function symbolInfoFor(symbol, partial) {
 process.on('message', async (job) => {
   let reply;
   try {
-    reply = job.type === 'compile' ? await compile(job) : await backtest(job);
+    reply = job.type === 'compile' ? await compile(job) : job.type === 'live_run' ? await liveRun(job) : await backtest(job);
   } catch (err) {
     reply = { ok: false, status: 500, detail: `worker failure: ${String(err?.message || err).slice(0, 300)}` };
   }

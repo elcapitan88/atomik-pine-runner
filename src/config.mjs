@@ -27,6 +27,16 @@ export const config = {
   // Symbol + timeframe used by /v1/compile when the caller names none.
   compileSymbol: env.PINE_COMPILE_SYMBOL || 'NQ',
   compileTimeframe: env.PINE_COMPILE_TIMEFRAME || '5m',
+  // Live chart indicators: DataHub trades -> bars -> PineTS -> Redis strategy_state.
+  // All three must be set for the live manager to start.
+  datahubWsUrl: env.DATAHUB_WS_URL || '',          // ws://atomik-datahub.internal:8000/ws
+  datahubApiKey: env.DATAHUB_API_KEY || '',
+  redisUrl: env.REDIS_URL || '',
+  backendInternalUrl: env.BACKEND_INTERNAL_URL || 'http://atomik-backend.internal:8000',
+  liveEnabled: (env.PINE_LIVE_ENABLED || 'true') === 'true',
+  liveWarmupBars: int('PINE_LIVE_WARMUP_BARS', 1500),
+  liveSyncSeconds: int('PINE_LIVE_SYNC_SECONDS', 30),
+  liveRunTimeoutMs: int('PINE_LIVE_RUN_TIMEOUT_MS', 20_000),
   get isProduction() {
     return this.environment === 'production';
   },
