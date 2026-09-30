@@ -31,13 +31,15 @@ export class StateBus {
     try { await this.pub?.quit(); } catch {}
   }
 
-  /** Publish + cache one strategy_state payload. */
-  async publishState(payload) {
+  /** Publish one strategy_state payload; `cache` also stores it as `:last`
+   * for late joiners (never for partial/intrabar frames). */
+  async publishState(payload, { cache = true } = {}) {
     if (!this.pub?.isOpen) return false;
     const channel = `strategy_state:${payload.strategy}:${payload.symbol}`;
     const body = JSON.stringify(payload);
     try {
-      await this.pub.multi().publish(channel, body).set(`${channel}:last`, body, { EX: 86_400 }).exec();
+      if (cache) await this.pub.multi().publish(channel, body).set(`${channel}:last`, body, { EX: 86_400 }).exec();
+      else await this.pub.publish(channel, body);
       this.published++;
       return true;
     } catch (err) {

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { BarAggregator, mergeBar } from '../src/live/bars.mjs';
-import { stateFrom, stateHash, emptyState } from '../src/live/state.mjs';
+import { stateFrom, stateHash, emptyState, partialStateFrom } from '../src/live/state.mjs';
 import { LiveManager } from '../src/live/manager.mjs';
 
 const T0 = Date.UTC(2026, 8, 29, 14, 30); // 14:30Z, on a 5-minute boundary
@@ -75,6 +75,18 @@ describe('stateFrom', () => {
     const b = { ...a, ts: 'other' };
     expect(stateHash(a)).toBe(stateHash(b));
     expect(stateHash(a)).not.toBe(stateHash(emptyState({ strategyKey: 'k', symbol: 'NQ' })));
+  });
+});
+
+describe('partialStateFrom', () => {
+  it('carries only the last bar of each plot, keeps drawings, flags partial', () => {
+    const r = { plots: {}, shapes: [], drawings: { boxes: [], lines: [], labels: [] }, series: { times: [1, 2, 3], plots: [{ id: 'p0', values: [1, 2, 3], colors: { palette: ['#a', '#b'], idx: [0, 1, 0] } }, { id: 'p1', values: [null, 5, 6], colors: null }], hlines: [], fills: [], barcolor: { palette: ['#c'], idx: [null, 0, 0] }, bgcolor: null } };
+    const p = partialStateFrom(r, { strategyKey: 'k', symbol: 'NQ' });
+    expect(p.partial).toBe(true);
+    expect(p.series.times).toEqual([3]);
+    expect(p.series.plots).toEqual([{ id: 'p0', values: [3], colors: { idx: [0] } }, { id: 'p1', values: [6], colors: null }]);
+    expect(p.series.barcolor).toEqual({ idx: [0] });
+    expect(partialStateFrom({ plots: {}, shapes: [], drawings: { boxes: [], lines: [], labels: [] }, series: null }, { strategyKey: 'k', symbol: 'NQ' })).toBe(null);
   });
 });
 

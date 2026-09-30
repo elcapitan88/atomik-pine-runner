@@ -34,7 +34,10 @@ export const config = {
   redisUrl: env.REDIS_URL || '',
   backendInternalUrl: env.BACKEND_INTERNAL_URL || 'http://atomik-backend.internal:8000',
   liveEnabled: (env.PINE_LIVE_ENABLED || 'true') === 'true',
-  liveWarmupBars: int('PINE_LIVE_WARMUP_BARS', 1500),
+  liveWarmupBars: int('PINE_LIVE_WARMUP_BARS', 5000),
+  // Intrabar: re-run on the forming bar while trades arrive, at most every N
+  // seconds per session (stretched automatically when a script runs slowly).
+  liveIntrabarSeconds: int('PINE_LIVE_INTRABAR_SECONDS', 2),
   liveSyncSeconds: int('PINE_LIVE_SYNC_SECONDS', 30),
   liveRunTimeoutMs: int('PINE_LIVE_RUN_TIMEOUT_MS', 20_000),
   // Re-publish unchanged state this often so a chart opened between bar closes

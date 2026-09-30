@@ -59,7 +59,9 @@ HTTP request ─▶ server.mjs (auth, validation) ─▶ pool.mjs ─▶ worker.
 | `DATAHUB_WS_URL` / `DATAHUB_API_KEY` | — | DataHub trade feed (live indicators) |
 | `REDIS_URL` | — | where chart state is published (live indicators) |
 | `BACKEND_INTERNAL_URL` | `http://atomik-backend.internal:8000` | lists the scripts to run live |
-| `PINE_LIVE_WARMUP_BARS` | `1500` | history each live session keeps |
+| `PINE_LIVE_WARMUP_BARS` | `5000` | history each live session keeps (and ships to the chart) |
+| `PINE_LIVE_INTRABAR_SECONDS` | `2` | min seconds between forming-bar re-runs per session |
+| `PINE_LIVE_HEARTBEAT_SECONDS` | `60` | full-state re-publish so open charts catch up |
 
 ## Development
 

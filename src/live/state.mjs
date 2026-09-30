@@ -55,6 +55,28 @@ export function stateFrom(result, { strategyKey, symbol }) {
   return { strategy: strategyKey, symbol, side: null, levels, drawings, series, ts: new Date().toISOString() };
 }
 
+/**
+ * Intrabar frame: the forming bar's values only (last time on the axis), plus
+ * the full drawings/levels (small). `partial: true` tells the chart to merge
+ * that one row instead of replacing the series. Null when there is no series.
+ */
+export function partialStateFrom(result, { strategyKey, symbol }) {
+  const full = stateFrom(result, { strategyKey, symbol });
+  const s = full.series;
+  if (!s || !s.times.length) return null;
+  const i = s.times.length - 1;
+  return {
+    ...full,
+    partial: true,
+    series: {
+      times: [s.times[i]],
+      plots: s.plots.map((p) => ({ id: p.id, values: [p.values[i]], colors: p.colors ? { idx: [p.colors.idx[i]] } : null })),
+      barcolor: s.barcolor ? { idx: [s.barcolor.idx[i]] } : null,
+      bgcolor: s.bgcolor ? { idx: [s.bgcolor.idx[i]] } : null,
+    },
+  };
+}
+
 /** Stable fingerprint of the drawable content (ignores `ts`). */
 export function stateHash(payload) {
   return createHash('sha1').update(JSON.stringify({ l: payload.levels, d: payload.drawings, s: payload.series })).digest('hex');

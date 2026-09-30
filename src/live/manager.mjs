@@ -9,7 +9,7 @@
 import { BarAggregator, mergeBar } from './bars.mjs';
 import { DataHubFeed } from './datahub.mjs';
 import { StateBus } from './redis.mjs';
-import { stateFrom, stateHash, emptyState } from './state.mjs';
+import { stateFrom, stateHash, emptyState, partialStateFrom } from './state.mjs';
 import { atomikToSeconds, SUPPORTED_TIMEFRAMES } from '../timeframes.mjs';
 import { tickerToRoot } from '../symbols.mjs';
 import * as warehouse from '../warehouse.mjs';
@@ -41,6 +41,9 @@ export class LiveManager {
     // pushes (a chart's catch-up request is dropped on Tradovate connections),
     // so without this a chart opened between bar closes stays empty.
     this.heartbeatTimer = setInterval(() => this.#heartbeat(), Math.max(15, this.config.liveHeartbeatSeconds || 60) * 1000);
+    // Intrabar: sessions whose symbol traded since their last run re-run on
+    // the forming bar, throttled per session (see #maybeIntrabar).
+    this.intrabarTimer = setInterval(() => this.#intrabarTick(), 1_000);
     await this.sync();
   }
 
@@ -48,6 +51,7 @@ export class LiveManager {
     clearInterval(this.syncTimer);
     clearInterval(this.tickTimer);
     clearInterval(this.heartbeatTimer);
+    clearInterval(this.intrabarTimer);
     clearTimeout(this.reloadTimer);
     this.feed.stop();
     await this.bus.stop();
@@ -55,7 +59,7 @@ export class LiveManager {
 
   get stats() {
     return {
-      sessions: [...this.sessions.values()].map((s) => ({ key: s.key, symbol: s.symbol, timeframe: s.timeframe, bars: s.bars.length, runs: s.runs, lastRunMs: s.lastRunMs, lastError: s.lastError })),
+      sessions: [...this.sessions.values()].map((s) => ({ key: s.key, symbol: s.symbol, timeframe: s.timeframe, bars: s.bars.length, runs: s.runs, intrabarRuns: s.intrabarRuns, intrabarMs: s.intrabarMs, lastRunMs: s.lastRunMs, lastError: s.lastError })),
       feed: this.feed.stats,
       bus: this.bus.stats,
       lastSync: this.lastSync,
@@ -100,7 +104,7 @@ export class LiveManager {
       for (const [key, it] of wanted) {
         const cur = this.sessions.get(key);
         if (cur && cur.source === it.source && cur.timeframe === it.timeframe && cur.strategyKey === it.strategy_key) continue;
-        const s = { key, id: it.strategy_code_id, strategyKey: it.strategy_key, symbol: it.symbol, timeframe: it.timeframe, seconds: atomikToSeconds(it.timeframe), source: it.source, symbolInfo: it.symbol_info || null, bars: [], warmed: false, runs: 0, lastRunMs: null, lastError: null, lastHash: null, lastPayload: null, running: false, pending: false };
+        const s = { key, id: it.strategy_code_id, strategyKey: it.strategy_key, symbol: it.symbol, timeframe: it.timeframe, seconds: atomikToSeconds(it.timeframe), source: it.source, symbolInfo: it.symbol_info || null, bars: [], warmed: false, runs: 0, intrabarRuns: 0, lastRunMs: null, lastError: null, lastHash: null, lastPayload: null, lastPartialHash: null, running: false, pending: false, dirty: false, lastIntrabarAt: 0, intrabarMs: (this.config.liveIntrabarSeconds || 2) * 1000 };
         this.sessions.set(key, s);
         this.log.info?.(`live: ${cur ? 'updated' : 'added'} ${key} (${it.symbol} ${it.timeframe})`);
         this.#warm(s).catch((err) => { s.lastError = `warmup: ${err.message}`; this.log.warn?.(`live: warmup failed for ${key}: ${err.message}`); });
@@ -139,6 +143,7 @@ export class LiveManager {
 
   #onTrade(symbol, price, size, ms) {
     for (const a of this.aggregators.values()) if (a.symbol === symbol) a.trade(price, size, ms);
+    for (const s of this.sessions.values()) if (s.symbol === symbol) s.dirty = true;
   }
 
   #onBar(symbol, seconds, bar) {
@@ -146,6 +151,28 @@ export class LiveManager {
       if (s.symbol !== symbol || s.seconds !== seconds || !s.warmed) continue;
       mergeBar(s.bars, bar, this.config.liveWarmupBars);
       this.#run(s);
+    }
+  }
+
+  // Test hooks (private methods aren't reachable from tests).
+  async intrabarTickForTest() { this.#intrabarTick(); await this.#drain(); }
+  async onBarForTest(symbol, seconds, bar) { this.#onBar(symbol, seconds, bar); await this.#drain(); }
+  async #drain() { for (let i = 0; i < 50; i++) { if (![...this.sessions.values()].some((s) => s.running)) return; await new Promise((r) => setTimeout(r, 5)); } }
+
+  /** Once a second: sessions whose symbol traded re-run on the forming bar,
+   * no more often than their interval (2s, stretched to 3x the last run time
+   * so a slow script can't monopolise the workers). */
+  #intrabarTick() {
+    const now = Date.now();
+    for (const s of this.sessions.values()) {
+      if (!s.warmed || !s.dirty || s.running) continue;
+      if (now - s.lastIntrabarAt < s.intrabarMs) continue;
+      const forming = this.aggregators.get(`${s.symbol}:${s.seconds}`)?.forming;
+      const last = s.bars[s.bars.length - 1];
+      if (!forming || (last && forming.openTime <= last.openTime)) continue;
+      s.dirty = false;
+      s.lastIntrabarAt = now;
+      this.#run(s, { forming });
     }
   }
 
@@ -158,22 +185,50 @@ export class LiveManager {
     await this.#run(s); // draw from history right away, not at the next bar close
   }
 
-  /** Re-run the script over the session's bars; publish when the drawings changed. */
-  async #run(s) {
-    if (s.running) { s.pending = true; return; }
+  /**
+   * Re-run the script over the session's bars and publish what changed.
+   *
+   * Closed-bar runs publish the FULL state (and cache it as `:last` for late
+   * joiners). Intrabar runs (`forming` given) append the forming bar to the
+   * history and publish a small PARTIAL frame — the last bar's values only —
+   * on the channel but not into the cache, so a chart that opens between bar
+   * closes still gets a complete picture and one already open gets the live
+   * candle's values every couple of seconds.
+   */
+  async #run(s, { forming = null } = {}) {
+    if (s.running) { if (!forming) s.pending = true; return; }
     s.running = true;
     try {
       do {
         s.pending = false;
+        const intrabar = !!forming;
+        const bars = intrabar ? [...s.bars, forming] : s.bars;
+        forming = null; // a queued re-run after this one is always a full run
         const started = Date.now();
-        const res = await this.pool.run({ type: 'live_run', source: s.source, symbol: s.symbol, timeframe: s.timeframe, bars: s.bars, symbol_info: s.symbolInfo }, { timeoutMs: this.config.liveRunTimeoutMs });
-        s.runs++;
+        const res = await this.pool.run({ type: 'live_run', source: s.source, symbol: s.symbol, timeframe: s.timeframe, bars, symbol_info: s.symbolInfo }, { timeoutMs: this.config.liveRunTimeoutMs });
         s.lastRunMs = Date.now() - started;
+        if (intrabar) {
+          s.intrabarRuns++;
+          s.intrabarMs = Math.max((this.config.liveIntrabarSeconds || 2) * 1000, 3 * s.lastRunMs);
+        } else {
+          s.runs++;
+        }
         if (!res.ok) { s.lastError = res.detail; this.log.warn?.(`live: ${s.key} run failed: ${res.detail}`); continue; }
         s.lastError = null;
+        if (intrabar) {
+          const partial = partialStateFrom(res.live, { strategyKey: s.strategyKey, symbol: s.symbol });
+          if (!partial) continue;
+          const hash = stateHash(partial);
+          if (hash !== s.lastPartialHash) {
+            s.lastPartialHash = hash;
+            await this.bus.publishState(partial, { cache: false });
+          }
+          continue;
+        }
         const payload = stateFrom(res.live, { strategyKey: s.strategyKey, symbol: s.symbol });
         const hash = stateHash(payload);
         s.lastPayload = payload;
+        s.lastPartialHash = null;
         if (hash !== s.lastHash) {
           s.lastHash = hash;
           await this.bus.publishState(payload);
