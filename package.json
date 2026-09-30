@@ -9,10 +9,17 @@
     "node": ">=24"
   },
   "scripts": {
+    "start": "node --no-node-snapshot src/server.mjs",
+    "test": "vitest run",
     "spike": "node --no-node-snapshot spike/sandbox-spike.mjs"
   },
   "dependencies": {
+    "fastify": "^5.2.0",
     "isolated-vm": "^7.0.1",
+    "pg": "^8.13.1",
     "pinets": "0.10.0"
+  },
+  "devDependencies": {
+    "vitest": "^3.0.5"
   }
 }

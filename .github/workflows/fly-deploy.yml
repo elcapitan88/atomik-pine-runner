@@ -1,0 +1,21 @@
+name: Fly Deploy (atomik-pine-runner)
+
+# Deploys on every push to main once the FLY_API_TOKEN repo secret exists
+# (fly tokens create deploy -a atomik-pine-runner). Workflow-only edits don't deploy.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '.github/**'
+
+jobs:
+  deploy:
+    name: Deploy atomik-pine-runner to Fly
+    runs-on: ubuntu-latest
+    concurrency: deploy-atomik-pine-runner
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - run: flyctl deploy --remote-only --ha=false
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

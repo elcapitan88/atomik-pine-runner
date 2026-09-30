@@ -1,0 +1,41 @@
+# atomik-pine-runner — sandboxed Pine Script execution for the Atomik backend.
+# Reached only over the private network as http://atomik-pine-runner.flycast.
+#
+# One-time setup (founder):
+#   fly apps create atomik-pine-runner -o personal
+#   fly ips allocate-v6 --private -a atomik-pine-runner
+#   fly secrets set -a atomik-pine-runner TIMESCALE_URL=... PINE_RUNNER_KEY=...
+#   (same PINE_RUNNER_KEY goes on atomik-backend, plus PINE_RUNNER_URL=http://atomik-pine-runner.flycast)
+app = "atomik-pine-runner"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8000"
+  ENVIRONMENT = "production"
+  PINE_WORKERS = "2"
+
+[http_service]
+  internal_port = 8000
+  # Flycast has no TLS; a redirect to https would break the backend's path.
+  force_https = false
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "30s"
+    method = "GET"
+    path = "/health"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 1024
+
+[[restart]]
+  policy = "always"
