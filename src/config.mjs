@@ -43,6 +43,11 @@ export const config = {
   // Re-publish unchanged state this often so a chart opened between bar closes
   // catches up even when its own catch-up request is lost.
   liveHeartbeatSeconds: int('PINE_LIVE_HEARTBEAT_SECONDS', 60),
+  // Trading: send signals for activated Pine strategies to the backend's
+  // /api/v1/trades/execute. OFF unless explicitly enabled; the key is the
+  // strategy engine's (the same one DataHub accepts).
+  tradingEnabled: env.PINE_TRADING_ENABLED === 'true',
+  executionApiKey: env.EXECUTION_API_KEY || env.DATAHUB_API_KEY || '',
   get isProduction() {
     return this.environment === 'production';
   },

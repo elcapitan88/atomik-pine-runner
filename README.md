@@ -62,6 +62,33 @@ HTTP request ─▶ server.mjs (auth, validation) ─▶ pool.mjs ─▶ worker.
 | `PINE_LIVE_WARMUP_BARS` | `5000` | history each live session keeps (and ships to the chart) |
 | `PINE_LIVE_INTRABAR_SECONDS` | `2` | min seconds between forming-bar re-runs per session |
 | `PINE_LIVE_HEARTBEAT_SECONDS` | `60` | full-state re-publish so open charts catch up |
+| `PINE_TRADING_ENABLED` | `false` | send signals for activated strategies; unset = shadow mode (signals are only logged) |
+| `EXECUTION_API_KEY` | `DATAHUB_API_KEY` | key for the backend's signal endpoint (the strategy engine's key) |
+
+## Live trading
+
+A `strategy()` script activated on a broker account runs like a live indicator, and after every
+run the script's simulated ledger (open trades, closed trades, pending orders) is diffed against
+what the session already signalled:
+
+- a trade that appears open → `BUY`/`SELL` with the bracket taken from its `strategy.exit(...)`
+  order (`stop`/`limit` as given, `profit`/`loss` converted from ticks with the symbol's tick size);
+- a trade the session entered that shows up closed → `EXIT` (`EXIT_FINAL`, or `EXIT_{pct}` for a
+  partial close), also when the script's own stop/target closed it — the backend does nothing if
+  a native bracket already flattened the account, and gets flat if none was resting;
+- a bracket that moved on a closed bar → bracket amend.
+
+Trades are identified by their entry (id, fill time, direction), never by PineTS's `trade_N`
+ordinals, which renumber as the history window slides. The first ledger of a session is a
+baseline: nothing from history is ever signalled. Positions the session opened are kept in Redis
+(`pine_trading:{code}:{symbol}`) so a restart still sends their exits. Quantity is never sent —
+each activation's own quantity applies on the backend. Signals go to the backend's
+`/api/v1/trades/execute` with the strategy engine's retry policy (entries give up fast, exits
+retry hard) and a stable `signal_id` per logical signal.
+
+With `PINE_TRADING_ENABLED` unset every signal is only logged (`trade[shadow] ...`) and listed
+under `live.sessions[].trading.recent` on `/health` — run a strategy this way for a session and
+compare against a backtest before letting it trade.
 
 ## Development
 

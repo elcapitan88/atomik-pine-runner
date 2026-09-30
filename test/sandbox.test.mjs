@@ -23,6 +23,24 @@ describe('sandbox runs PineTS', () => {
     expect(r.strategy.closedtrades.some((t) => t.size < 0)).toBe(true);
   });
 
+  it('exit orders keep from_entry + tick offsets (live trading builds brackets from them)', async () => {
+    const src = `//@version=6
+strategy("Bracket", overlay=true, pyramiding=0)
+if bar_index % 50 == 0
+    strategy.entry("L", strategy.long)
+strategy.exit("LX", from_entry="L", profit=40, loss=20)`;
+    const r = await run(src);
+    expect(r.ok).toBe(true);
+    const ex = r.strategy.pending_orders.find((o) => o.category === 'exit');
+    expect(ex).toBeTruthy();
+    expect(ex).toMatchObject({ id: 'LX', from_entry: 'L', profit: 40, loss: 20, status: 'pending' });
+    const t = r.strategy.closedtrades[0];
+    expect(t.entry_id).toBe('L');
+    expect(t.exit_id).toBe('LX');
+    expect(typeof t.entry_time).toBe('number');
+    expect(r.strategy.opentrades.every((o) => 'entry_comment' in o)).toBe(true);
+  });
+
   it('request.security through the host provider', async () => {
     const r = await run(SCRIPTS.mtf_security);
     expect(r.ok).toBe(true);

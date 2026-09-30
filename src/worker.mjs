@@ -144,7 +144,7 @@ async function liveRun(job) {
     maxSeriesBars: config.liveWarmupBars,
   });
   if (!res.ok) return { ok: false, status: 400, detail: res.reason === 'data' ? res.error : `Script error: ${cleanError(res.error)}` };
-  return { ok: true, live: { kind: res.kind, title: res.title, bars: res.bars, lastTime: res.lastTime, plots: res.plots, shapes: res.shapes, drawings: res.drawings, series: res.series, ms: res.ms } };
+  return { ok: true, live: { kind: res.kind, title: res.title, bars: res.bars, lastTime: res.lastTime, plots: res.plots, shapes: res.shapes, drawings: res.drawings, series: res.series, strategy: res.strategy, ms: res.ms } };
 }
 
 function defaultSymbolInfo(symbol) {

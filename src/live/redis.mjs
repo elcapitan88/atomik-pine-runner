@@ -48,6 +48,22 @@ export class StateBus {
     }
   }
 
+  /** Small JSON documents (live trading positions survive a restart this way). */
+  async setJson(key, value, { ttlSeconds = 7 * 86_400 } = {}) {
+    if (!this.pub?.isOpen) return false;
+    try { await this.pub.set(key, JSON.stringify(value), { EX: ttlSeconds }); return true; } catch (err) { this.log.warn?.(`set ${key} failed: ${err.message}`); return false; }
+  }
+
+  async getJson(key) {
+    if (!this.pub?.isOpen) return null;
+    try { const v = await this.pub.get(key); return v ? JSON.parse(v) : null; } catch (err) { this.log.warn?.(`get ${key} failed: ${err.message}`); return null; }
+  }
+
+  async del(key) {
+    if (!this.pub?.isOpen) return false;
+    try { await this.pub.del(key); return true; } catch { return false; }
+  }
+
   get stats() {
     return { connected: !!this.pub?.isOpen, published: this.published };
   }

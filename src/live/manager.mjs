@@ -10,19 +10,28 @@ import { BarAggregator, mergeBar } from './bars.mjs';
 import { DataHubFeed } from './datahub.mjs';
 import { StateBus } from './redis.mjs';
 import { stateFrom, stateHash, emptyState, partialStateFrom } from './state.mjs';
+import { diffLedger, newLedgerState, liveSnapshot } from './signals.mjs';
+import { ExecutionClient } from './execution.mjs';
 import { atomikToSeconds, SUPPORTED_TIMEFRAMES } from '../timeframes.mjs';
 import { tickerToRoot } from '../symbols.mjs';
 import * as warehouse from '../warehouse.mjs';
 
+const liveKey = (s) => `pine_trading:${s.id}:${s.symbol}`;
+
 export class LiveManager {
-  constructor({ config, pool, log = console, fetchImpl = fetch }) {
+  constructor({ config, pool, log = console, fetchImpl = fetch, warehouseImpl = warehouse }) {
     this.config = config;
     this.pool = pool;
     this.log = log;
     this.fetch = fetchImpl;
+    this.warehouse = warehouseImpl;
     this.sessions = new Map();     // key -> session
     this.aggregators = new Map();  // `${symbol}:${seconds}` -> BarAggregator
     this.bus = new StateBus({ url: config.redisUrl, log });
+    // Trading: strategies activated on an account get their ledger diffed into
+    // signals. With PINE_TRADING_ENABLED unset the signals are only logged
+    // ("shadow"), which is how a strategy is checked before it trades.
+    this.execution = new ExecutionClient({ backendUrl: config.backendInternalUrl, apiKey: config.executionApiKey || '', log, fetchImpl });
     this.feed = new DataHubFeed({ url: config.datahubWsUrl, apiKey: config.datahubApiKey, onTrade: (s, p, z, ms) => this.#onTrade(s, p, z, ms), log });
     this.syncTimer = null;
     this.tickTimer = null;
@@ -59,7 +68,11 @@ export class LiveManager {
 
   get stats() {
     return {
-      sessions: [...this.sessions.values()].map((s) => ({ key: s.key, symbol: s.symbol, timeframe: s.timeframe, bars: s.bars.length, runs: s.runs, intrabarRuns: s.intrabarRuns, intrabarMs: s.intrabarMs, lastRunMs: s.lastRunMs, lastError: s.lastError })),
+      sessions: [...this.sessions.values()].map((s) => ({
+        key: s.key, symbol: s.symbol, timeframe: s.timeframe, bars: s.bars.length, runs: s.runs, intrabarRuns: s.intrabarRuns, intrabarMs: s.intrabarMs, lastRunMs: s.lastRunMs, lastError: s.lastError,
+        trading: s.trading ? { strategy: s.strategyName, activations: s.activations.length, live_accounts: s.activations.filter((a) => !a.is_paper).length, positions: liveSnapshot(s.ledger), shadow: s.shadowSignals, sent: s.signalsSent, failed: s.signalsFailed, recent: s.signalLog.slice(-10) } : null,
+      })),
+      trading: { enabled: !!this.config.tradingEnabled, execution: this.execution.stats },
       feed: this.feed.stats,
       bus: this.bus.stats,
       lastSync: this.lastSync,
@@ -103,10 +116,24 @@ export class LiveManager {
       // Add new / changed sessions.
       for (const [key, it] of wanted) {
         const cur = this.sessions.get(key);
-        if (cur && cur.source === it.source && cur.timeframe === it.timeframe && cur.strategyKey === it.strategy_key) continue;
-        const s = { key, id: it.strategy_code_id, strategyKey: it.strategy_key, symbol: it.symbol, timeframe: it.timeframe, seconds: atomikToSeconds(it.timeframe), source: it.source, symbolInfo: it.symbol_info || null, bars: [], warmed: false, runs: 0, intrabarRuns: 0, lastRunMs: null, lastError: null, lastHash: null, lastPayload: null, lastPartialHash: null, running: false, pending: false, dirty: false, lastIntrabarAt: 0, intrabarMs: (this.config.liveIntrabarSeconds || 2) * 1000 };
+        const activations = Array.isArray(it.activations) ? it.activations : [];
+        const trading = it.kind === 'trade' && activations.length > 0 && !!it.strategy_name;
+        if (cur && cur.source === it.source && cur.timeframe === it.timeframe && cur.strategyKey === it.strategy_key) {
+          // Same script: refresh who trades it without resetting the session
+          // (a rebuild would forget the positions it opened).
+          if (trading && !cur.trading) this.log.info?.(`live: ${key} now trading as "${it.strategy_name}" (${activations.length} account(s))`);
+          if (!trading && cur.trading) this.log.info?.(`live: ${key} stopped trading`);
+          cur.trading = trading; cur.activations = activations; cur.strategyName = it.strategy_name || cur.strategyName; cur.symbolInfo = it.symbol_info || cur.symbolInfo;
+          continue;
+        }
+        const s = {
+          key, id: it.strategy_code_id, strategyKey: it.strategy_key, symbol: it.symbol, timeframe: it.timeframe, seconds: atomikToSeconds(it.timeframe), source: it.source, symbolInfo: it.symbol_info || null,
+          bars: [], warmed: false, runs: 0, intrabarRuns: 0, lastRunMs: null, lastError: null, lastHash: null, lastPayload: null, lastPartialHash: null, running: false, pending: false, dirty: false, lastIntrabarAt: 0, intrabarMs: (this.config.liveIntrabarSeconds || 2) * 1000,
+          trading, activations, strategyName: it.strategy_name || null, ledger: newLedgerState(), outbox: Promise.resolve(), shadowSignals: 0, signalsSent: 0, signalsFailed: 0, signalLog: [],
+        };
+        if (cur) { s.ledger = cur.ledger; s.shadowSignals = cur.shadowSignals; s.signalsSent = cur.signalsSent; s.signalsFailed = cur.signalsFailed; s.signalLog = cur.signalLog; s.outbox = cur.outbox; }
         this.sessions.set(key, s);
-        this.log.info?.(`live: ${cur ? 'updated' : 'added'} ${key} (${it.symbol} ${it.timeframe})`);
+        this.log.info?.(`live: ${cur ? 'updated' : 'added'} ${key} (${it.symbol} ${it.timeframe})${trading ? ` trading as "${it.strategy_name}"` : ''}`);
         this.#warm(s).catch((err) => { s.lastError = `warmup: ${err.message}`; this.log.warn?.(`live: warmup failed for ${key}: ${err.message}`); });
       }
       this.#syncFeed();
@@ -177,7 +204,15 @@ export class LiveManager {
   }
 
   async #warm(s) {
-    const bars = await warehouse.getBars(s.symbol, s.timeframe, null, null, this.config.liveWarmupBars);
+    if (s.trading && !s.ledger.baselined) {
+      // Positions opened by a previous process, so their exits still travel.
+      const restored = await this.bus.getJson(liveKey(s));
+      if (restored && Object.keys(restored).length) {
+        s.ledger = newLedgerState(restored);
+        this.log.info?.(`live: ${s.key} restored ${Object.keys(restored).length} open position(s) from a previous run`);
+      }
+    }
+    const bars = await this.warehouse.getBars(s.symbol, s.timeframe, null, null, this.config.liveWarmupBars);
     if (!this.sessions.has(s.key)) return;
     s.bars = bars;
     s.warmed = true;
@@ -215,6 +250,9 @@ export class LiveManager {
         }
         if (!res.ok) { s.lastError = res.detail; this.log.warn?.(`live: ${s.key} run failed: ${res.detail}`); continue; }
         s.lastError = null;
+        if (s.trading && res.live.strategy) {
+          try { await this.#trade(s, res.live.strategy, { full: !intrabar, lastTime: res.live.lastTime }); } catch (err) { this.log.error?.(`live: ${s.key} trade step failed: ${err.message}`); }
+        }
         if (intrabar) {
           const partial = partialStateFrom(res.live, { strategyKey: s.strategyKey, symbol: s.symbol });
           if (!partial) continue;
@@ -236,6 +274,42 @@ export class LiveManager {
       } while (s.pending && this.sessions.has(s.key));
     } finally {
       s.running = false;
+    }
+  }
+
+  /**
+   * Diff the script's ledger against what this session already signalled and
+   * send (or, in shadow mode, log) the difference. Sends are queued per
+   * session so exits and entries leave in order even while the next run is
+   * already computing; a slow retry never blocks the chart.
+   */
+  async #trade(s, ledger, { full, lastTime = null }) {
+    const ctx = { strategyName: s.strategyName, symbol: s.symbol, mintick: s.symbolInfo?.mintick };
+    const hadPositions = s.ledger.live.size;
+    const { signals, amends } = diffLedger(s.ledger, { ...ledger, lastTime }, ctx, { full });
+    if (!signals.length && !amends.length) return;
+    if (signals.length || s.ledger.live.size !== hadPositions) {
+      if (s.ledger.live.size) await this.bus.setJson(liveKey(s), liveSnapshot(s.ledger));
+      else await this.bus.del(liveKey(s));
+    }
+    const enabled = !!this.config.tradingEnabled;
+    for (const sig of signals) {
+      const rec = { at: new Date().toISOString(), action: sig.action, comment: sig.comment, trade_key: sig.trade_key, stop_loss: sig.stop_loss ?? null, take_profit: sig.take_profit ?? null, note: sig.note ?? null, mode: enabled ? 'send' : 'shadow', result: null };
+      s.signalLog.push(rec);
+      if (s.signalLog.length > 30) s.signalLog.shift();
+      const line = `${sig.action} ${sig.comment} "${s.strategyName}" ${s.symbol}${sig.stop_loss != null ? ` sl=${sig.stop_loss}` : ''}${sig.take_profit != null ? ` tp=${sig.take_profit}` : ''}${sig.note ? ` (${sig.note})` : ''} id=${sig.signal_id}`;
+      if (!enabled) { s.shadowSignals++; this.log.warn?.(`trade[shadow] ${s.key}: ${line}`); continue; }
+      this.log.info?.(`trade ${s.key}: ${line}`);
+      s.outbox = s.outbox
+        .then(() => this.execution.send(sig, ctx))
+        .then((r) => { if (r.ok) s.signalsSent++; else s.signalsFailed++; rec.result = r.ok ? 'ok' : (r.status ? `http ${r.status}` : r.error || 'failed'); })
+        .catch((err) => { s.signalsFailed++; rec.result = String(err?.message || err); });
+    }
+    for (const a of amends) {
+      const line = `AMEND "${s.strategyName}" ${s.symbol} sl=${a.stop_loss} tp=${a.take_profit}`;
+      if (!enabled) { this.log.warn?.(`trade[shadow] ${s.key}: ${line}`); continue; }
+      this.log.info?.(`trade ${s.key}: ${line}`);
+      s.outbox = s.outbox.then(() => this.execution.amend(a, ctx)).catch(() => {});
     }
   }
 }

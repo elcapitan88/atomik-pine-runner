@@ -224,8 +224,15 @@ return (async () => {
       exit_id: t.exit_id || null, exit_comment: t.exit_comment || null, exit_price: t.exit_price, exit_time: t.exit_time, exit_bar_index: t.exit_bar_index,
       size: t.size, profit: t.profit, commission: t.commission, max_drawdown: t.max_drawdown, max_runup: t.max_runup,
     })),
-    opentrades: (st.opentrades || []).map((t) => ({ id: t.id, entry_id: t.entry_id, entry_price: t.entry_price, entry_time: t.entry_time, size: t.size })),
-    pending_orders: (st.pending_orders || []).map((o) => ({ id: o.id, direction: o.direction, qty: o.qty, type: o.type, limit: o.limit ?? null, stop: o.stop ?? null, category: o.category || null, status: o.status })),
+    opentrades: (st.opentrades || []).map((t) => ({ id: t.id, entry_id: t.entry_id, entry_comment: t.entry_comment || null, entry_price: t.entry_price, entry_time: t.entry_time, entry_bar_index: t.entry_bar_index, size: t.size })),
+    // Exit orders keep strategy.exit's own fields: from_entry ties the bracket to
+    // its entry, profit/loss are TICK offsets from the fill, limit/stop are
+    // absolute prices. Live trading turns these into the entry's bracket.
+    pending_orders: (st.pending_orders || []).map((o) => ({
+      id: o.id, direction: o.direction, qty: o.qty, qty_percent: o.qty_percent ?? null, type: o.type, limit: o.limit ?? null, stop: o.stop ?? null,
+      category: o.category || null, status: o.status, from_entry: o.from_entry ?? null, profit: o.profit ?? null, loss: o.loss ?? null,
+      trail_price: o.trail_price ?? null, trail_points: o.trail_points ?? null, trail_offset: o.trail_offset ?? null, comment: o.comment ?? null,
+    })),
     netprofit: st.netprofit, grossprofit: st.grossprofit, grossloss: st.grossloss, max_drawdown: st.max_drawdown, max_runup: st.max_runup,
     wintrades: st.wintrades, losstrades: st.losstrades, eventrades: st.eventrades, position_size: st.position_size,
     sharpe_ratio: st.sharpe_ratio, sortino_ratio: st.sortino_ratio, initial_capital: st.initial_capital, equity: st.equity,
