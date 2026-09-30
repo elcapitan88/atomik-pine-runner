@@ -60,7 +60,7 @@ HTTP request ─▶ server.mjs (auth, validation) ─▶ pool.mjs ─▶ worker.
 | `REDIS_URL` | — | where chart state is published (live indicators) |
 | `BACKEND_INTERNAL_URL` | `http://atomik-backend.internal:8000` | lists the scripts to run live |
 | `PINE_LIVE_WARMUP_BARS` | `5000` | history each live session keeps (and ships to the chart) |
-| `PINE_LIVE_INTRABAR_SECONDS` | `2` | min seconds between forming-bar re-runs per session |
+| `PINE_LIVE_INTRABAR_SECONDS` | `5` | min seconds between forming-bar re-runs per chart session (trading sessions drop to 1s only while an order can fill mid-bar) |
 | `PINE_LIVE_HEARTBEAT_SECONDS` | `60` | full-state re-publish so open charts catch up |
 | `PINE_TRADING_ENABLED` | `false` | send signals for activated strategies; unset = shadow mode (signals are only logged) |
 | `EXECUTION_API_KEY` | `DATAHUB_API_KEY` | key for the backend's signal endpoint (the strategy engine's key) |
@@ -93,9 +93,15 @@ compare against a backtest before letting it trade.
 Latency: the first print of a new bar closes the previous one and triggers ONE run over the
 closed history plus the forming bar, so an entry that fills at the bar's open is decided one run
 after that print (the run's `latency_ms` is on each signal and `lastLatencyMs` on the session).
-Trading sessions' runs go to the front of the worker queue, their intrabar cadence is 1s, intrabar
-runs only ship the last bars' chart values, and `request.security` data is cached for 20s between
-runs. A closed bar no print has followed yet (quiet symbol) is run on its own within a second.
+Trading sessions' runs go to the front of the worker queue, intrabar runs only ship the last bars'
+chart values, and `request.security` data is cached for 20s between runs. A closed bar no print
+has followed yet (quiet symbol) is run on its own within a second. Pine evaluates a script once
+per bar close and fills market entries at the next open — exactly what the boundary run sees — so
+a trading session re-runs mid-bar (1s cadence) only while its ledger holds something that can fill
+mid-bar: a resting stop/limit entry, a trailing exit, or `calc_on_every_tick=true`. Every re-run is
+a full recompute of the history; on a shared-CPU machine a tight loop exhausts the CPU burst
+budget and slows every run down, which is why idle is the default and a dedicated CPU is the
+right machine for trading.
 
 ## Development
 

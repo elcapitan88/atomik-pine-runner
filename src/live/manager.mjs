@@ -10,7 +10,7 @@ import { BarAggregator, mergeBar } from './bars.mjs';
 import { DataHubFeed } from './datahub.mjs';
 import { StateBus } from './redis.mjs';
 import { stateFrom, stateHash, emptyState, partialStateFrom } from './state.mjs';
-import { diffLedger, newLedgerState, liveSnapshot } from './signals.mjs';
+import { diffLedger, newLedgerState, liveSnapshot, needsIntrabar } from './signals.mjs';
 import { ExecutionClient } from './execution.mjs';
 import { atomikToSeconds, SUPPORTED_TIMEFRAMES } from '../timeframes.mjs';
 import { tickerToRoot } from '../symbols.mjs';
@@ -134,7 +134,7 @@ export class LiveManager {
         }
         const s = {
           key, id: it.strategy_code_id, strategyKey: it.strategy_key, symbol: it.symbol, timeframe: it.timeframe, seconds: atomikToSeconds(it.timeframe), source: it.source, symbolInfo: it.symbol_info || null,
-          bars: [], warmed: false, runs: 0, intrabarRuns: 0, lastRunMs: null, lastError: null, lastHash: null, lastPayload: null, lastPartialHash: null, running: false, pending: false, wantBoundary: false, closedPending: false, closedAt: 0, dirty: false, lastIntrabarAt: 0, triggerAt: 0, intrabarMs: (trading ? 1 : (this.config.liveIntrabarSeconds || 2)) * 1000,
+          bars: [], warmed: false, runs: 0, intrabarRuns: 0, lastRunMs: null, lastError: null, lastHash: null, lastPayload: null, lastPartialHash: null, running: false, pending: false, wantBoundary: false, closedPending: false, closedAt: 0, dirty: false, lastIntrabarAt: 0, triggerAt: 0, intrabarMs: (this.config.liveIntrabarSeconds || 5) * 1000, intrabarNeeded: false,
           trading, activations, strategyName: it.strategy_name || null, ledger: newLedgerState(), outbox: Promise.resolve(), shadowSignals: 0, signalsSent: 0, signalsFailed: 0, signalLog: [], lastLatencyMs: null,
         };
         if (cur) { s.ledger = cur.ledger; s.shadowSignals = cur.shadowSignals; s.signalsSent = cur.signalsSent; s.signalsFailed = cur.signalsFailed; s.signalLog = cur.signalLog; s.outbox = cur.outbox; }
@@ -230,14 +230,21 @@ export class LiveManager {
   }
 
   /** Once a second: sessions whose symbol traded re-run on the forming bar,
-   * no more often than their interval (2s for charts, 1s for trading
-   * sessions, stretched to 3x the last run time so a slow script can't
-   * monopolise the workers). */
+   * no more often than their interval, stretched to 3x the last run time so
+   * a slow script can't monopolise the workers. Charts get the configured
+   * cadence; a trading session drops to 1s only while its ledger has orders
+   * that can fill mid-bar (resting stop/limit entries, trailing exits), since
+   * everything else is decided by the boundary run. Every re-run is a full
+   * recompute, and on a shared CPU a tight loop burns the burst budget and
+   * makes EVERY run slower — so idle is the default. */
   #intrabarTick() {
     this.#flushClosed(1000);
     const now = Date.now();
+    const chartFloor = (this.config.liveIntrabarSeconds || 5) * 1000;
     for (const s of this.sessions.values()) {
       if (!s.warmed || !s.dirty || s.running || s.closedPending) continue;
+      const floor = s.trading && s.intrabarNeeded ? 1000 : chartFloor;
+      s.intrabarMs = Math.max(floor, 3 * (s.lastRunMs || 0));
       if (now - s.lastIntrabarAt < s.intrabarMs) continue;
       const forming = this.aggregators.get(`${s.symbol}:${s.seconds}`)?.forming;
       const last = s.bars[s.bars.length - 1];
@@ -307,12 +314,12 @@ export class LiveManager {
         s.lastRunMs = Date.now() - started;
         if (isFull) s.runs++; else s.intrabarRuns++;
         if (boundary) { s.lastBoundaryMs = s.lastRunMs; s.pending = true; }
-        if (f) s.intrabarMs = Math.max(s.trading ? 1000 : (this.config.liveIntrabarSeconds || 2) * 1000, 3 * s.lastRunMs);
         if (!res.ok) {
           s.lastError = res.detail;
           this.log.warn?.(`live: ${s.key} run failed: ${res.detail}`);
         } else {
           s.lastError = null;
+          if (s.trading) s.intrabarNeeded = needsIntrabar(res.live.strategy);
           if (s.trading && res.live.strategy) {
             try { await this.#trade(s, res.live.strategy, { full: isFull, lastTime: res.live.lastTime, triggerAt }); } catch (err) { this.log.error?.(`live: ${s.key} trade step failed: ${err.message}`); }
           }

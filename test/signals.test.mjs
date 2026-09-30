@@ -145,6 +145,20 @@ describe('diffLedger', () => {
   });
 });
 
+describe('needsIntrabar', () => {
+  it('is true only for resting stop/limit entries, trailing exits or calc_on_every_tick', async () => {
+    const { needsIntrabar } = await import('../src/live/signals.mjs');
+    expect(needsIntrabar(null)).toBe(false);
+    expect(needsIntrabar({ pending_orders: [] })).toBe(false);
+    expect(needsIntrabar({ pending_orders: [{ category: 'entry', type: 'market', status: 'pending' }] })).toBe(false);
+    expect(needsIntrabar({ pending_orders: [{ category: 'exit', profit: 10, loss: 5, status: 'pending' }] })).toBe(false);
+    expect(needsIntrabar({ pending_orders: [{ category: 'entry', type: 'limit', status: 'pending' }] })).toBe(true);
+    expect(needsIntrabar({ pending_orders: [{ category: 'entry', type: 'stop', status: 'filled' }] })).toBe(false);
+    expect(needsIntrabar({ pending_orders: [{ category: 'exit', trail_points: 20, status: 'pending' }] })).toBe(true);
+    expect(needsIntrabar({ config: { calc_on_every_tick: true }, pending_orders: [] })).toBe(true);
+  });
+});
+
 describe('ExecutionClient', () => {
   const mk = (responses) => {
     const calls = [];

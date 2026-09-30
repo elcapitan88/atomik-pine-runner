@@ -45,6 +45,23 @@ export function newLedgerState(restoredLive = null) {
 
 export const liveSnapshot = (state) => Object.fromEntries(state.live);
 
+/**
+ * Does this ledger need re-runs INSIDE the bar? Pine evaluates a script once
+ * per bar close (unless calc_on_every_tick), and market entries fill at the
+ * next open, which the boundary run sees. Only resting stop/limit ENTRY orders
+ * and trailing exits can fill mid-bar (the broker holds the plain brackets).
+ */
+export function needsIntrabar(strategy) {
+  if (!strategy) return false;
+  if (strategy.config?.calc_on_every_tick) return true;
+  for (const o of strategy.pending_orders || []) {
+    if (o.status && o.status !== 'pending') continue;
+    if (o.category === 'entry' && o.type && o.type !== 'market') return true;
+    if (o.category === 'exit' && (num(o.trail_price) || num(o.trail_points) || num(o.trail_offset))) return true;
+  }
+  return false;
+}
+
 function signalId(strategyName, symbol, kind, key) {
   return createHash('sha1').update(`${strategyName}|${symbol}|${kind}|${key}`).digest('hex').slice(0, 32);
 }

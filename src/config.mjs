@@ -37,7 +37,9 @@ export const config = {
   liveWarmupBars: int('PINE_LIVE_WARMUP_BARS', 5000),
   // Intrabar: re-run on the forming bar while trades arrive, at most every N
   // seconds per session (stretched automatically when a script runs slowly).
-  liveIntrabarSeconds: int('PINE_LIVE_INTRABAR_SECONDS', 2),
+  // Every re-run is a full recompute; on a shared-CPU machine a tight cadence
+  // burns the burst budget and slows every run down, so the default is loose.
+  liveIntrabarSeconds: int('PINE_LIVE_INTRABAR_SECONDS', 5),
   liveSyncSeconds: int('PINE_LIVE_SYNC_SECONDS', 30),
   liveRunTimeoutMs: int('PINE_LIVE_RUN_TIMEOUT_MS', 20_000),
   // Re-publish unchanged state this often so a chart opened between bar closes
