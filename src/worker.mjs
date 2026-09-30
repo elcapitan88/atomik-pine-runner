@@ -115,6 +115,24 @@ async function backtest(job) {
 // Live chart run: the primary series comes from the session's own bar history
 // (passed in), so a live bar that the warehouse hasn't stored yet is still
 // seen; request.security for other timeframes reads the warehouse.
+// request.security data for live runs: the same higher-timeframe bars are asked
+// for on every re-run (every couple of seconds per session), and they change at
+// most once per bar of THAT timeframe. A short cache keeps the warehouse out
+// of the intrabar path; staleness is bounded by the TTL.
+const SECURITY_CACHE_TTL_MS = 20_000;
+const securityCache = new Map(); // key -> {at, bars}
+
+async function cachedFetchBars(tickerId, tf, limit, sDate, eDate) {
+  const key = `${tickerId}|${tf}|${limit ?? ''}|${sDate ?? ''}|${eDate ?? ''}`;
+  const hit = securityCache.get(key);
+  const now = Date.now();
+  if (hit && now - hit.at < SECURITY_CACHE_TTL_MS) return hit.bars;
+  const bars = await fetchBars(tickerId, tf, limit, sDate, eDate);
+  securityCache.set(key, { at: now, bars });
+  if (securityCache.size > 64) securityCache.delete(securityCache.keys().next().value);
+  return bars;
+}
+
 async function liveRun(job) {
   const pineTf = atomikToPine(job.timeframe);
   if (!pineTf) return { ok: false, status: 400, detail: `Unsupported timeframe '${job.timeframe}'.` };
@@ -129,7 +147,7 @@ async function liveRun(job) {
       if (limit) bars = bars.slice(-limit);
       return bars;
     }
-    return fetchBars(tickerId, tf, limit, sDate, eDate);
+    return cachedFetchBars(tickerId, tf, limit, sDate, eDate);
   };
   const res = await runPine({
     source: job.source,
@@ -141,7 +159,9 @@ async function liveRun(job) {
     timeoutMs: config.liveRunTimeoutMs,
     memoryMb: config.isolateMemoryMb,
     maxPlotPoints: 400,
-    maxSeriesBars: config.liveWarmupBars,
+    // An intrabar run only ships the last bar's values, so it asks for a
+    // couple of series bars instead of the whole history.
+    maxSeriesBars: Number.isFinite(job.max_series_bars) && job.max_series_bars > 0 ? job.max_series_bars : config.liveWarmupBars,
   });
   if (!res.ok) return { ok: false, status: 400, detail: res.reason === 'data' ? res.error : `Script error: ${cleanError(res.error)}` };
   return { ok: true, live: { kind: res.kind, title: res.title, bars: res.bars, lastTime: res.lastTime, plots: res.plots, shapes: res.shapes, drawings: res.drawings, series: res.series, strategy: res.strategy, ms: res.ms } };

@@ -90,6 +90,13 @@ With `PINE_TRADING_ENABLED` unset every signal is only logged (`trade[shadow] ..
 under `live.sessions[].trading.recent` on `/health` — run a strategy this way for a session and
 compare against a backtest before letting it trade.
 
+Latency: the first print of a new bar closes the previous one and triggers ONE run over the
+closed history plus the forming bar, so an entry that fills at the bar's open is decided one run
+after that print (the run's `latency_ms` is on each signal and `lastLatencyMs` on the session).
+Trading sessions' runs go to the front of the worker queue, their intrabar cadence is 1s, intrabar
+runs only ship the last bars' chart values, and `request.security` data is cached for 20s between
+runs. A closed bar no print has followed yet (quiet symbol) is run on its own within a second.
+
 ## Development
 
 Node.js 24+. `isolated-vm` needs `--no-node-snapshot` on Node 20 and later (the npm scripts pass it).

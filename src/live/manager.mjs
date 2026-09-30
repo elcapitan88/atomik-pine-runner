@@ -70,7 +70,7 @@ export class LiveManager {
     return {
       sessions: [...this.sessions.values()].map((s) => ({
         key: s.key, symbol: s.symbol, timeframe: s.timeframe, bars: s.bars.length, runs: s.runs, intrabarRuns: s.intrabarRuns, intrabarMs: s.intrabarMs, lastRunMs: s.lastRunMs, lastError: s.lastError,
-        trading: s.trading ? { strategy: s.strategyName, activations: s.activations.length, live_accounts: s.activations.filter((a) => !a.is_paper).length, positions: liveSnapshot(s.ledger), shadow: s.shadowSignals, sent: s.signalsSent, failed: s.signalsFailed, recent: s.signalLog.slice(-10) } : null,
+        trading: s.trading ? { strategy: s.strategyName, activations: s.activations.length, live_accounts: s.activations.filter((a) => !a.is_paper).length, positions: liveSnapshot(s.ledger), shadow: s.shadowSignals, sent: s.signalsSent, failed: s.signalsFailed, lastLatencyMs: s.lastLatencyMs, recent: s.signalLog.slice(-10) } : null,
       })),
       trading: { enabled: !!this.config.tradingEnabled, execution: this.execution.stats },
       feed: this.feed.stats,
@@ -134,8 +134,8 @@ export class LiveManager {
         }
         const s = {
           key, id: it.strategy_code_id, strategyKey: it.strategy_key, symbol: it.symbol, timeframe: it.timeframe, seconds: atomikToSeconds(it.timeframe), source: it.source, symbolInfo: it.symbol_info || null,
-          bars: [], warmed: false, runs: 0, intrabarRuns: 0, lastRunMs: null, lastError: null, lastHash: null, lastPayload: null, lastPartialHash: null, running: false, pending: false, dirty: false, lastIntrabarAt: 0, intrabarMs: (this.config.liveIntrabarSeconds || 2) * 1000,
-          trading, activations, strategyName: it.strategy_name || null, ledger: newLedgerState(), outbox: Promise.resolve(), shadowSignals: 0, signalsSent: 0, signalsFailed: 0, signalLog: [],
+          bars: [], warmed: false, runs: 0, intrabarRuns: 0, lastRunMs: null, lastError: null, lastHash: null, lastPayload: null, lastPartialHash: null, running: false, pending: false, wantBoundary: false, closedPending: false, closedAt: 0, dirty: false, lastIntrabarAt: 0, triggerAt: 0, intrabarMs: (trading ? 1 : (this.config.liveIntrabarSeconds || 2)) * 1000,
+          trading, activations, strategyName: it.strategy_name || null, ledger: newLedgerState(), outbox: Promise.resolve(), shadowSignals: 0, signalsSent: 0, signalsFailed: 0, signalLog: [], lastLatencyMs: null,
         };
         if (cur) { s.ledger = cur.ledger; s.shadowSignals = cur.shadowSignals; s.signalsSent = cur.signalsSent; s.signalsFailed = cur.signalsFailed; s.signalLog = cur.signalLog; s.outbox = cur.outbox; }
         this.sessions.set(key, s);
@@ -176,35 +176,75 @@ export class LiveManager {
 
   #onTrade(symbol, price, size, ms) {
     for (const a of this.aggregators.values()) if (a.symbol === symbol) a.trade(price, size, ms);
-    for (const s of this.sessions.values()) if (s.symbol === symbol) s.dirty = true;
+    const now = Date.now();
+    for (const s of this.sessions.values()) {
+      if (s.symbol !== symbol) continue;
+      s.dirty = true;
+      if (!s.warmed || !s.closedPending) continue;
+      // This print opened a new bar and closed the previous one (#onBar just
+      // flagged the session). Run ONCE over the closed history plus the
+      // forming bar: the closed-bar state and the new bar's fills come out of
+      // the same run, so a trading session's entry is decided one run after
+      // the first print instead of two runs and a throttle later.
+      const forming = this.aggregators.get(`${s.symbol}:${s.seconds}`)?.forming;
+      const last = s.bars[s.bars.length - 1];
+      if (!forming || !last || forming.openTime <= last.openTime) continue;
+      s.closedPending = false;
+      s.dirty = false;
+      s.lastIntrabarAt = now;
+      s.triggerAt = now;
+      this.#run(s, { forming, full: true });
+    }
   }
 
   #onBar(symbol, seconds, bar) {
     for (const s of this.sessions.values()) {
       if (s.symbol !== symbol || s.seconds !== seconds || !s.warmed) continue;
       mergeBar(s.bars, bar, this.config.liveWarmupBars);
-      this.#run(s);
+      // Closed by a print: #onTrade runs it with the forming bar right away.
+      // Closed by the wall clock (quiet symbol): #intrabarTick runs the
+      // closed history on its next pass.
+      s.closedPending = true;
+      s.closedAt = Date.now();
     }
   }
 
   // Test hooks (private methods aren't reachable from tests).
   async intrabarTickForTest() { this.#intrabarTick(); await this.#drain(); }
-  async onBarForTest(symbol, seconds, bar) { this.#onBar(symbol, seconds, bar); await this.#drain(); }
-  async #drain() { for (let i = 0; i < 50; i++) { if (![...this.sessions.values()].some((s) => s.running)) return; await new Promise((r) => setTimeout(r, 5)); } }
+  async onBarForTest(symbol, seconds, bar) { this.#onBar(symbol, seconds, bar); this.#flushClosed(0); await this.#drain(); }
+  async onTradeForTest(symbol, price, size, ms) { this.#onTrade(symbol, price, size, ms); await this.#drain(); }
+  async #drain() {
+    await new Promise((r) => setImmediate(r));
+    for (let i = 0; i < 200; i++) { if (![...this.sessions.values()].some((s) => s.running)) return; await new Promise((r) => setTimeout(r, 5)); }
+  }
 
-  /** Once a second: sessions whose symbol traded re-run on the forming bar,
-   * no more often than their interval (2s, stretched to 3x the last run time
-   * so a slow script can't monopolise the workers). */
-  #intrabarTick() {
+  /** Closed bars no print has picked up yet (wall-clock closes): run the closed history. */
+  #flushClosed(minAgeMs) {
     const now = Date.now();
     for (const s of this.sessions.values()) {
-      if (!s.warmed || !s.dirty || s.running) continue;
+      if (!s.closedPending || !s.warmed || now - s.closedAt < minAgeMs) continue;
+      s.closedPending = false;
+      s.triggerAt = now;
+      this.#run(s);
+    }
+  }
+
+  /** Once a second: sessions whose symbol traded re-run on the forming bar,
+   * no more often than their interval (2s for charts, 1s for trading
+   * sessions, stretched to 3x the last run time so a slow script can't
+   * monopolise the workers). */
+  #intrabarTick() {
+    this.#flushClosed(1000);
+    const now = Date.now();
+    for (const s of this.sessions.values()) {
+      if (!s.warmed || !s.dirty || s.running || s.closedPending) continue;
       if (now - s.lastIntrabarAt < s.intrabarMs) continue;
       const forming = this.aggregators.get(`${s.symbol}:${s.seconds}`)?.forming;
       const last = s.bars[s.bars.length - 1];
       if (!forming || (last && forming.openTime <= last.openTime)) continue;
       s.dirty = false;
       s.lastIntrabarAt = now;
+      s.triggerAt = now;
       this.#run(s, { forming });
     }
   }
@@ -236,48 +276,76 @@ export class LiveManager {
    * closes still gets a complete picture and one already open gets the live
    * candle's values every couple of seconds.
    */
-  async #run(s, { forming = null } = {}) {
-    if (s.running) { if (!forming) s.pending = true; return; }
+  async #run(s, { forming = null, full = null } = {}) {
+    if (s.running) {
+      // Queue behind the run in flight: a bar boundary re-runs with whatever
+      // the forming bar looks like by then; a plain closed-bar run re-runs
+      // the history; an ordinary intrabar request is simply dropped (the next
+      // tick brings a fresher one).
+      if (forming && full) s.wantBoundary = true;
+      else if (!forming) s.pending = true;
+      return;
+    }
     s.running = true;
     try {
+      let next = { forming, full };
       do {
-        s.pending = false;
-        const intrabar = !!forming;
-        const bars = intrabar ? [...s.bars, forming] : s.bars;
-        forming = null; // a queued re-run after this one is always a full run
+        const f = next.forming;
+        const isFull = next.full ?? !f;         // boundary run: forming bar AND full frame
+        const bars = f ? [...s.bars, f] : s.bars;
+        const triggerAt = s.triggerAt || Date.now();
         const started = Date.now();
-        const res = await this.pool.run({ type: 'live_run', source: s.source, symbol: s.symbol, timeframe: s.timeframe, bars, symbol_info: s.symbolInfo }, { timeoutMs: this.config.liveRunTimeoutMs });
+        const res = await this.pool.run(
+          { type: 'live_run', source: s.source, symbol: s.symbol, timeframe: s.timeframe, bars, symbol_info: s.symbolInfo, max_series_bars: isFull ? this.config.liveWarmupBars : 2 },
+          { timeoutMs: this.config.liveRunTimeoutMs, priority: !!s.trading },
+        );
         s.lastRunMs = Date.now() - started;
-        if (intrabar) {
-          s.intrabarRuns++;
-          s.intrabarMs = Math.max((this.config.liveIntrabarSeconds || 2) * 1000, 3 * s.lastRunMs);
+        if (isFull) s.runs++; else s.intrabarRuns++;
+        if (f) s.intrabarMs = Math.max(s.trading ? 1000 : (this.config.liveIntrabarSeconds || 2) * 1000, 3 * s.lastRunMs);
+        if (!res.ok) {
+          s.lastError = res.detail;
+          this.log.warn?.(`live: ${s.key} run failed: ${res.detail}`);
         } else {
-          s.runs++;
-        }
-        if (!res.ok) { s.lastError = res.detail; this.log.warn?.(`live: ${s.key} run failed: ${res.detail}`); continue; }
-        s.lastError = null;
-        if (s.trading && res.live.strategy) {
-          try { await this.#trade(s, res.live.strategy, { full: !intrabar, lastTime: res.live.lastTime }); } catch (err) { this.log.error?.(`live: ${s.key} trade step failed: ${err.message}`); }
-        }
-        if (intrabar) {
-          const partial = partialStateFrom(res.live, { strategyKey: s.strategyKey, symbol: s.symbol });
-          if (!partial) continue;
-          const hash = stateHash(partial);
-          if (hash !== s.lastPartialHash) {
-            s.lastPartialHash = hash;
-            await this.bus.publishState(partial, { cache: false });
+          s.lastError = null;
+          if (s.trading && res.live.strategy) {
+            try { await this.#trade(s, res.live.strategy, { full: isFull, lastTime: res.live.lastTime, triggerAt }); } catch (err) { this.log.error?.(`live: ${s.key} trade step failed: ${err.message}`); }
           }
-          continue;
+          if (!isFull) {
+            const partial = partialStateFrom(res.live, { strategyKey: s.strategyKey, symbol: s.symbol });
+            if (partial) {
+              const hash = stateHash(partial);
+              if (hash !== s.lastPartialHash) {
+                s.lastPartialHash = hash;
+                await this.bus.publishState(partial, { cache: false });
+              }
+            }
+          } else {
+            const payload = stateFrom(res.live, { strategyKey: s.strategyKey, symbol: s.symbol });
+            const hash = stateHash(payload);
+            s.lastPayload = payload;
+            s.lastPartialHash = null;
+            if (hash !== s.lastHash) {
+              s.lastHash = hash;
+              await this.bus.publishState(payload);
+            }
+          }
         }
-        const payload = stateFrom(res.live, { strategyKey: s.strategyKey, symbol: s.symbol });
-        const hash = stateHash(payload);
-        s.lastPayload = payload;
-        s.lastPartialHash = null;
-        if (hash !== s.lastHash) {
-          s.lastHash = hash;
-          await this.bus.publishState(payload);
+        // Follow-ups that queued while this run was in flight.
+        if (s.wantBoundary) {
+          s.wantBoundary = false;
+          s.pending = false;
+          s.triggerAt = Date.now();
+          const cf = this.aggregators.get(`${s.symbol}:${s.seconds}`)?.forming;
+          const last = s.bars[s.bars.length - 1];
+          next = cf && last && cf.openTime > last.openTime ? { forming: cf, full: true } : { forming: null, full: null };
+        } else if (s.pending) {
+          s.pending = false;
+          s.triggerAt = Date.now();
+          next = { forming: null, full: null };
+        } else {
+          next = null;
         }
-      } while (s.pending && this.sessions.has(s.key));
+      } while (next && this.sessions.has(s.key));
     } finally {
       s.running = false;
     }
@@ -289,7 +357,7 @@ export class LiveManager {
    * session so exits and entries leave in order even while the next run is
    * already computing; a slow retry never blocks the chart.
    */
-  async #trade(s, ledger, { full, lastTime = null }) {
+  async #trade(s, ledger, { full, lastTime = null, triggerAt = null }) {
     const ctx = { strategyName: s.strategyName, symbol: s.symbol, mintick: s.symbolInfo?.mintick };
     const hadPositions = s.ledger.live.size;
     const { signals, amends } = diffLedger(s.ledger, { ...ledger, lastTime }, ctx, { full });
@@ -299,11 +367,15 @@ export class LiveManager {
       else await this.bus.del(liveKey(s));
     }
     const enabled = !!this.config.tradingEnabled;
+    // Decision latency: from the print (or bar close) that triggered this run
+    // to the signal leaving the diff. The wire adds ~100ms on top.
+    const latencyMs = triggerAt ? Date.now() - triggerAt : null;
+    if (signals.length && latencyMs != null) s.lastLatencyMs = latencyMs;
     for (const sig of signals) {
-      const rec = { at: new Date().toISOString(), action: sig.action, comment: sig.comment, trade_key: sig.trade_key, stop_loss: sig.stop_loss ?? null, take_profit: sig.take_profit ?? null, note: sig.note ?? null, mode: enabled ? 'send' : 'shadow', result: null };
+      const rec = { at: new Date().toISOString(), action: sig.action, comment: sig.comment, trade_key: sig.trade_key, stop_loss: sig.stop_loss ?? null, take_profit: sig.take_profit ?? null, exit_reason: sig.exit_reason ?? null, note: sig.note ?? null, latency_ms: latencyMs, mode: enabled ? 'send' : 'shadow', result: null };
       s.signalLog.push(rec);
       if (s.signalLog.length > 30) s.signalLog.shift();
-      const line = `${sig.action} ${sig.comment} "${s.strategyName}" ${s.symbol}${sig.stop_loss != null ? ` sl=${sig.stop_loss}` : ''}${sig.take_profit != null ? ` tp=${sig.take_profit}` : ''}${sig.note ? ` (${sig.note})` : ''} id=${sig.signal_id}`;
+      const line = `${sig.action} ${sig.comment} "${s.strategyName}" ${s.symbol}${sig.stop_loss != null ? ` sl=${sig.stop_loss}` : ''}${sig.take_profit != null ? ` tp=${sig.take_profit}` : ''}${sig.note ? ` (${sig.note})` : ''} id=${sig.signal_id}${latencyMs != null ? ` latency=${latencyMs}ms` : ''}`;
       if (!enabled) { s.shadowSignals++; this.log.warn?.(`trade[shadow] ${s.key}: ${line}`); continue; }
       this.log.info?.(`trade ${s.key}: ${line}`);
       s.outbox = s.outbox

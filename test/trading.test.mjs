@@ -118,6 +118,66 @@ describe('trade sessions', () => {
     expect(sent.map((x) => x.body.action)).toEqual(['BUY']);
   });
 
+  it('the first print of a new bar triggers ONE boundary run (closed history + forming bar) that decides the entry', async () => {
+    const ledgers = [
+      { opentrades: [], closedtrades: [], pending_orders: [] },           // baseline: bar 3 closes / bar 4 opens
+      { opentrades: [openL(T0 + 5 * 300_000)], closedtrades: [], pending_orders: [] }, // bar 4 closes / bar 5 opens: fill at bar 5 open
+    ];
+    const runs = [];
+    const published = [];
+    const sent = [];
+    const m = new LiveManager({
+      config: { ...base, tradingEnabled: true },
+      pool: { run: async (job, opts) => { runs.push({ bars: job.bars.length, seriesBars: job.max_series_bars, priority: opts.priority }); return { ok: true, live: liveResult(job.bars, ledgers.shift() || { opentrades: [], closedtrades: [], pending_orders: [] }) }; } },
+      log: { info() {}, warn() {}, error() {} },
+      fetchImpl: async (url, opts) => { if (url.includes('/internal/pine/active')) return { ok: true, json: async () => [item()] }; sent.push(JSON.parse(opts.body)); return { status: 200, json: async () => ({}) }; },
+    });
+    m.bus = { publishState: async (p, o) => { published.push({ partial: !!p.partial, cache: !o || o.cache !== false }); return true; }, setJson: async () => true, getJson: async () => null, del: async () => true, stats: {} };
+    m.feed = { setSymbols() {}, stats: {} };
+    await m.sync(); // creates the real aggregator for NQ:300
+    const s = m.sessions.get('9:NQ');
+    s.bars = [bar(0), bar(1), bar(2)];
+    s.warmed = true;
+
+    // First print of bar 3: nothing closed yet -> no run (dirty only).
+    await m.onTradeForTest('NQ', 10, 1, T0 + 3 * 300_000 + 1_000);
+    expect(runs.length).toBe(0);
+    expect(s.dirty).toBe(true);
+
+    // First print of bar 4 closes bar 3 -> one run over [0..3] + forming 4, full frame, priority.
+    await m.onTradeForTest('NQ', 11, 1, T0 + 4 * 300_000 + 200);
+    expect(runs).toEqual([{ bars: 5, seriesBars: 100, priority: true }]);
+    expect(s.runs).toBe(1);
+    expect(s.intrabarRuns).toBe(0);
+    expect(s.bars.length).toBe(4);
+    expect(published.at(-1)).toEqual({ partial: false, cache: true });
+    expect(s.closedPending).toBe(false);
+
+    // First print of bar 5: the entry fills at that open and is signalled by the boundary run, with its latency.
+    await m.onTradeForTest('NQ', 12, 1, T0 + 5 * 300_000 + 300);
+    await s.outbox;
+    expect(runs.length).toBe(2);
+    expect(sent.map((x) => x.action)).toEqual(['BUY']);
+    expect(typeof s.signalLog.at(-1).latency_ms).toBe('number');
+    expect(s.lastLatencyMs).toBe(s.signalLog.at(-1).latency_ms);
+
+    // A wall-clock close with no print yet waits for the tick, then runs the closed history alone.
+    m.aggregators.get('NQ:300').tick(T0 + 6 * 300_000 + 1);
+    expect(s.closedPending).toBe(true);
+    expect(runs.length).toBe(2);
+    s.closedAt = Date.now() - 2_000;
+    await m.intrabarTickForTest();
+    expect(runs.at(-1)).toEqual({ bars: 6, seriesBars: 100, priority: true });
+    expect(s.closedPending).toBe(false);
+
+    // Ordinary intrabar runs ask for the last bars only.
+    await m.onTradeForTest('NQ', 13, 1, T0 + 6 * 300_000 + 5_000);
+    s.lastIntrabarAt = 0;
+    await m.intrabarTickForTest();
+    expect(runs.at(-1)).toEqual({ bars: 7, seriesBars: 2, priority: true });
+    expect(s.intrabarRuns).toBe(1);
+  });
+
   it('restores positions from Redis on warm-up so an exit after a restart still travels', async () => {
     const key = 'L|' + (T0 + 3 * 300_000) + '|1';
     const ledgers = [

@@ -56,12 +56,18 @@ export class WorkerPool {
     }
   }
 
-  /** @returns {Promise<object>} the worker's reply */
-  run(payload, { timeoutMs }) {
+  /**
+   * @param {object} payload
+   * @param {{timeoutMs: number, priority?: boolean}} opts  priority jobs go to the
+   *   front of the queue (a trading session's run must not wait behind chart runs)
+   * @returns {Promise<object>} the worker's reply
+   */
+  run(payload, { timeoutMs, priority = false }) {
     if (this.closing) return Promise.resolve({ ok: false, status: 503, detail: 'shutting down' });
     const id = randomUUID();
     return new Promise((resolve) => {
-      this.queue.push({ id, payload: { ...payload, id }, timeoutMs, resolve, timer: null });
+      const job = { id, payload: { ...payload, id }, timeoutMs, resolve, timer: null };
+      if (priority) this.queue.unshift(job); else this.queue.push(job);
       this.#pump();
     });
   }

@@ -127,7 +127,7 @@ return (async () => {
   // colours as palette indexes. The chart turns this into a real TradingView
   // study (legend, hover values, sub-pane, styles).
   const cssColor = (c) => (typeof c === 'string' && /^#[0-9a-f]{8}$/i.test(c) ? c.slice(0, 7) : (typeof c === 'string' && c ? c : null));
-  const maxBars = Math.max(100, opts.maxSeriesBars || 3000);
+  const maxBars = Math.max(1, opts.maxSeriesBars || 3000);
   const from = Math.max(0, n - maxBars);
   const times = [];
   const timeIndex = new Map();
