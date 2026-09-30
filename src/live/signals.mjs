@@ -160,10 +160,14 @@ export function diffLedger(state, ledger, ctx, { full = true } = {}) {
 
   // A position we hold that the script's ledger no longer knows in EITHER list
   // (a recompute over the slid history window changed its mind): the script
-  // thinks it is flat, so get flat. Closed-bar runs only.
+  // thinks it is flat, so get flat. Closed-bar runs only — and never for a
+  // position that filled on a bar this run did not include (a closed-history
+  // run right after a boundary run cannot see the forming bar's fill).
   if (full) {
+    const lastTime = num(ledger?.lastTime) ? ledger.lastTime : null;
     for (const [k, pos] of [...state.live]) {
       if (openByKey.has(k)) continue;
+      if (lastTime != null && num(pos?.entry_time) && pos.entry_time > lastTime) continue;
       state.live.delete(k);
       signals.push(exitSignal(ctx, k, pos, { reason: 'strategy_exit', idKey: `desync|${k}|${ledger?.lastTime ?? ''}`, note: 'ledger_desync' }));
     }

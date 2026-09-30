@@ -119,9 +119,12 @@ describe('trade sessions', () => {
   });
 
   it('the first print of a new bar triggers ONE boundary run (closed history + forming bar) that decides the entry', async () => {
+    const E = { opentrades: [], closedtrades: [], pending_orders: [] };
     const ledgers = [
-      { opentrades: [], closedtrades: [], pending_orders: [] },           // baseline: bar 3 closes / bar 4 opens
-      { opentrades: [openL(T0 + 5 * 300_000)], closedtrades: [], pending_orders: [] }, // bar 4 closes / bar 5 opens: fill at bar 5 open
+      E,                                                                   // boundary run: bar 3 closes / bar 4 opens (baseline)
+      E,                                                                   // follow-up full run over the closed history [0..3]
+      { opentrades: [openL(T0 + 5 * 300_000)], closedtrades: [], pending_orders: [] }, // boundary run: bar 4 closes / bar 5 opens: fill at bar 5 open
+      E,                                                                   // follow-up over [0..4]: the fill is on bar 5, not in this history
     ];
     const runs = [];
     const published = [];
@@ -144,19 +147,22 @@ describe('trade sessions', () => {
     expect(runs.length).toBe(0);
     expect(s.dirty).toBe(true);
 
-    // First print of bar 4 closes bar 3 -> one run over [0..3] + forming 4, full frame, priority.
+    // First print of bar 4 closes bar 3 -> a fast boundary run over [0..3] + forming 4 (last bars'
+    // chart values only, partial frame), then the follow-up full run over the closed history.
     await m.onTradeForTest('NQ', 11, 1, T0 + 4 * 300_000 + 200);
-    expect(runs).toEqual([{ bars: 5, seriesBars: 100, priority: true }]);
-    expect(s.runs).toBe(1);
+    expect(runs).toEqual([{ bars: 5, seriesBars: 2, priority: true }, { bars: 4, seriesBars: 100, priority: true }]);
+    expect(s.runs).toBe(2);
     expect(s.intrabarRuns).toBe(0);
     expect(s.bars.length).toBe(4);
-    expect(published.at(-1)).toEqual({ partial: false, cache: true });
+    // (this fixture has no series, so the boundary run's partial frame has nothing to publish)
+    expect(published).toEqual([{ partial: false, cache: true }]);
     expect(s.closedPending).toBe(false);
+    expect(typeof s.lastBoundaryMs).toBe('number');
 
     // First print of bar 5: the entry fills at that open and is signalled by the boundary run, with its latency.
     await m.onTradeForTest('NQ', 12, 1, T0 + 5 * 300_000 + 300);
     await s.outbox;
-    expect(runs.length).toBe(2);
+    expect(runs.length).toBe(4);
     expect(sent.map((x) => x.action)).toEqual(['BUY']);
     expect(typeof s.signalLog.at(-1).latency_ms).toBe('number');
     expect(s.lastLatencyMs).toBe(s.signalLog.at(-1).latency_ms);
@@ -164,7 +170,7 @@ describe('trade sessions', () => {
     // A wall-clock close with no print yet waits for the tick, then runs the closed history alone.
     m.aggregators.get('NQ:300').tick(T0 + 6 * 300_000 + 1);
     expect(s.closedPending).toBe(true);
-    expect(runs.length).toBe(2);
+    expect(runs.length).toBe(4);
     s.closedAt = Date.now() - 2_000;
     await m.intrabarTickForTest();
     expect(runs.at(-1)).toEqual({ bars: 6, seriesBars: 100, priority: true });

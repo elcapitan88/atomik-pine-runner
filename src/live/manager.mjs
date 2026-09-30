@@ -69,7 +69,7 @@ export class LiveManager {
   get stats() {
     return {
       sessions: [...this.sessions.values()].map((s) => ({
-        key: s.key, symbol: s.symbol, timeframe: s.timeframe, bars: s.bars.length, runs: s.runs, intrabarRuns: s.intrabarRuns, intrabarMs: s.intrabarMs, lastRunMs: s.lastRunMs, lastError: s.lastError,
+        key: s.key, symbol: s.symbol, timeframe: s.timeframe, bars: s.bars.length, runs: s.runs, intrabarRuns: s.intrabarRuns, intrabarMs: s.intrabarMs, lastRunMs: s.lastRunMs, lastBoundaryMs: s.lastBoundaryMs ?? null, lastError: s.lastError,
         trading: s.trading ? { strategy: s.strategyName, activations: s.activations.length, live_accounts: s.activations.filter((a) => !a.is_paper).length, positions: liveSnapshot(s.ledger), shadow: s.shadowSignals, sent: s.signalsSent, failed: s.signalsFailed, lastLatencyMs: s.lastLatencyMs, recent: s.signalLog.slice(-10) } : null,
       })),
       trading: { enabled: !!this.config.tradingEnabled, execution: this.execution.stats },
@@ -291,16 +291,22 @@ export class LiveManager {
       let next = { forming, full };
       do {
         const f = next.forming;
-        const isFull = next.full ?? !f;         // boundary run: forming bar AND full frame
+        const boundary = !!(f && next.full);    // first print of a new bar
+        const isFull = next.full ?? !f;         // ledger semantics (desync/amend checks)
+        // The boundary run exists to decide fills fast, so it ships only the
+        // last bars' chart values like an intrabar run; the closed history
+        // gets its full, cached frame from the follow-up run queued below.
+        const chartFull = isFull && !boundary;
         const bars = f ? [...s.bars, f] : s.bars;
         const triggerAt = s.triggerAt || Date.now();
         const started = Date.now();
         const res = await this.pool.run(
-          { type: 'live_run', source: s.source, symbol: s.symbol, timeframe: s.timeframe, bars, symbol_info: s.symbolInfo, max_series_bars: isFull ? this.config.liveWarmupBars : 2 },
+          { type: 'live_run', source: s.source, symbol: s.symbol, timeframe: s.timeframe, bars, symbol_info: s.symbolInfo, max_series_bars: chartFull ? this.config.liveWarmupBars : 2 },
           { timeoutMs: this.config.liveRunTimeoutMs, priority: !!s.trading },
         );
         s.lastRunMs = Date.now() - started;
         if (isFull) s.runs++; else s.intrabarRuns++;
+        if (boundary) { s.lastBoundaryMs = s.lastRunMs; s.pending = true; }
         if (f) s.intrabarMs = Math.max(s.trading ? 1000 : (this.config.liveIntrabarSeconds || 2) * 1000, 3 * s.lastRunMs);
         if (!res.ok) {
           s.lastError = res.detail;
@@ -310,7 +316,7 @@ export class LiveManager {
           if (s.trading && res.live.strategy) {
             try { await this.#trade(s, res.live.strategy, { full: isFull, lastTime: res.live.lastTime, triggerAt }); } catch (err) { this.log.error?.(`live: ${s.key} trade step failed: ${err.message}`); }
           }
-          if (!isFull) {
+          if (!chartFull) {
             const partial = partialStateFrom(res.live, { strategyKey: s.strategyKey, symbol: s.symbol });
             if (partial) {
               const hash = stateHash(partial);

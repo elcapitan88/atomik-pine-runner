@@ -118,6 +118,19 @@ describe('diffLedger', () => {
     expect(st.live.size).toBe(0);
   });
 
+  it('a closed-history run cannot desync a position that filled on the forming bar it did not include', () => {
+    const st = baseline();
+    // boundary run: history up to T, forming bar T+5m -> fill at T+5m open
+    diffLedger(st, { opentrades: [open('t1', 1, 100, { entry_time: T + 300_000 })], closedtrades: [], pending_orders: [], lastTime: T + 300_000 }, CTX);
+    // follow-up full run over the closed history only (last bar T): the trade is not there yet
+    let r = diffLedger(st, { ...empty, lastTime: T }, CTX);
+    expect(r.signals).toEqual([]);
+    expect(st.live.size).toBe(1);
+    // a later full run that INCLUDES that bar and still lacks the trade -> desync exit
+    r = diffLedger(st, { ...empty, lastTime: T + 600_000 }, CTX);
+    expect(r.signals.map((x) => x.note)).toEqual(['ledger_desync']);
+  });
+
   it('positions restored from a previous process are kept when still open, exited when not', () => {
     const k1 = entryKey(open('a', 1, 100));
     const k2 = entryKey(open('b', -1, 200, { entry_id: 'S', entry_time: T - 60_000 }));
