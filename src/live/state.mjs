@@ -56,9 +56,31 @@ export function stateFrom(result, { strategyKey, symbol }) {
 }
 
 /**
+ * The STRUCTURE of a native-study series (plots, styles, palettes, hlines,
+ * fills, pane) without its per-bar values: what the chart needs to register
+ * the study before the script ever runs live. Same shape as `series` with
+ * empty value arrays, so the chart reads both the same way.
+ */
+export function seriesSpec(series) {
+  if (!series) return null;
+  return {
+    overlay: !!series.overlay, title: series.title || null, shorttitle: series.shorttitle || null, precision: series.precision ?? null,
+    times: [],
+    plots: (series.plots || []).map((p) => ({ id: p.id, key: p.key, title: p.title, style: p.style, color: p.color, linewidth: p.linewidth, overlay: p.overlay, values: [], colors: p.colors ? { palette: p.colors.palette, idx: [] } : null })),
+    hlines: series.hlines || [],
+    fills: series.fills || [],
+    barcolor: series.barcolor ? { palette: series.barcolor.palette, idx: [] } : null,
+    bgcolor: series.bgcolor ? { palette: series.bgcolor.palette, idx: [] } : null,
+  };
+}
+
+/**
  * Intrabar frame: the forming bar's values only (last time on the axis), plus
  * the full drawings/levels (small). `partial: true` tells the chart to merge
  * that one row instead of replacing the series. Null when there is no series.
+ * Colour indexes come WITH their palette: an intrabar run builds its palette
+ * from its own last bars, so its indexes don't match the full frame's; the
+ * chart maps them back by colour.
  */
 export function partialStateFrom(result, { strategyKey, symbol }) {
   const full = stateFrom(result, { strategyKey, symbol });
@@ -70,9 +92,9 @@ export function partialStateFrom(result, { strategyKey, symbol }) {
     partial: true,
     series: {
       times: [s.times[i]],
-      plots: s.plots.map((p) => ({ id: p.id, values: [p.values[i]], colors: p.colors ? { idx: [p.colors.idx[i]] } : null })),
-      barcolor: s.barcolor ? { idx: [s.barcolor.idx[i]] } : null,
-      bgcolor: s.bgcolor ? { idx: [s.bgcolor.idx[i]] } : null,
+      plots: s.plots.map((p) => ({ id: p.id, values: [p.values[i]], colors: p.colors ? { palette: p.colors.palette, idx: [p.colors.idx[i]] } : null })),
+      barcolor: s.barcolor ? { palette: s.barcolor.palette, idx: [s.barcolor.idx[i]] } : null,
+      bgcolor: s.bgcolor ? { palette: s.bgcolor.palette, idx: [s.bgcolor.idx[i]] } : null,
     },
   };
 }

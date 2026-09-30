@@ -6,6 +6,7 @@
 import { config } from './config.mjs';
 import { runPine, PineStream } from './sandbox.mjs';
 import { mergeBar } from './live/bars.mjs';
+import { seriesSpec } from './live/state.mjs';
 import { toBacktestPayload } from './translate.mjs';
 import * as warehouse from './warehouse.mjs';
 import { tickerToRoot } from './symbols.mjs';
@@ -83,6 +84,9 @@ async function compile(job) {
       bars_checked: res.bars,
       plots: Object.keys(res.plots || {}),
       has_drawings: !!(res.drawings && (res.drawings.boxes.length || res.drawings.lines.length || res.drawings.labels.length)) || (res.shapes || []).length > 0,
+      // Plot structure (no values): the chart registers the script as a native
+      // study from this before it ever runs live.
+      series_spec: seriesSpec(res.series),
       trades_in_sample: res.strategy ? res.strategy.closedtrades.length : null,
       ms: res.ms,
     },

@@ -84,8 +84,8 @@ describe('partialStateFrom', () => {
     const p = partialStateFrom(r, { strategyKey: 'k', symbol: 'NQ' });
     expect(p.partial).toBe(true);
     expect(p.series.times).toEqual([3]);
-    expect(p.series.plots).toEqual([{ id: 'p0', values: [3], colors: { idx: [0] } }, { id: 'p1', values: [6], colors: null }]);
-    expect(p.series.barcolor).toEqual({ idx: [0] });
+    expect(p.series.plots).toEqual([{ id: 'p0', values: [3], colors: { palette: ['#a', '#b'], idx: [0] } }, { id: 'p1', values: [6], colors: null }]);
+    expect(p.series.barcolor).toEqual({ palette: ['#c'], idx: [0] });
     expect(partialStateFrom({ plots: {}, shapes: [], drawings: { boxes: [], lines: [], labels: [] }, series: null }, { strategyKey: 'k', symbol: 'NQ' })).toBe(null);
   });
 });

@@ -62,6 +62,22 @@ describe('POST /v1/compile', () => {
     expect(j).toMatchObject({ ok: true, kind: 'strategy', is_automatable: true });
     expect(j.trades_in_sample).toBeGreaterThan(0);
   });
+  it('returns the plot structure for native-study registration', async () => {
+    const src = `//@version=6
+indicator("Spec", overlay=false)
+v = ta.rsi(close, 14)
+plot(v, "rsi", color=v > 50 ? color.green : color.red, style=plot.style_histogram)
+hline(70, "hi")`;
+    const j = await (await post('/v1/compile', { source: src })).json();
+    expect(j.ok).toBe(true);
+    const s = j.series_spec;
+    expect(s).toMatchObject({ overlay: false, title: 'Spec', times: [] });
+    expect(s.plots).toHaveLength(1);
+    expect(s.plots[0]).toMatchObject({ id: 'p0', title: 'rsi', style: 'histogram', values: [] });
+    expect(s.plots[0].colors.palette.length).toBe(2);
+    expect(s.plots[0].colors.idx).toEqual([]);
+    expect(s.hlines[0]).toMatchObject({ title: 'hi', price: 70 });
+  });
   it('syntax error with line', async () => {
     const r = await post('/v1/compile', { source: SCRIPTS.bad_syntax });
     expect(r.status).toBe(200);
