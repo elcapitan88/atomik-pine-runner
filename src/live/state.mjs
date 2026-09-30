@@ -1,19 +1,17 @@
-// Sandbox result -> the `strategy_state` payload the chart already renders
-// (fastapi_backend pine_transpiler emitted the same shapes from Python):
-//   box      {kind:'box', id, t1, t2, p1(top), p2(bottom)}     times in epoch SECONDS
-//   shape    {kind:'shape', id, t, price, dir:'up'|'down', text}
-//   polyline {kind:'polyline', id, color, points:[{t, price}]}  (new: plot() lines)
-//   level    {id, label, price, kind:'info', style}
+// Sandbox result -> the `strategy_state` payload the chart renders.
+//   drawings: box {kind:'box', id, t1, t2, p1(top), p2(bottom)}      epoch SECONDS
+//             shape {kind:'shape', id, t, price, dir:'up'|'down', text}
+//   levels:   {id, label, price, kind:'info', style}
+//   series:   plot()/hline()/fill()/barcolor()/bgcolor() values on one time
+//             axis — the chart registers a native TradingView study from it
+//             (legend, hover values, sub-pane, plot styles). See sandbox.mjs.
 import { createHash } from 'node:crypto';
 
 const MAX_BOXES = 100;
 const MAX_SHAPES = 60;
-const MAX_LINES = 6;
-const MAX_LINE_POINTS = 400;
 const MAX_LEVELS = 8;
 const sec = (ms) => Math.floor(ms / 1000);
 const num = (v) => typeof v === 'number' && Number.isFinite(v);
-const cssColor = (c) => (typeof c === 'string' && /^#[0-9a-f]{8}$/i.test(c) ? c.slice(0, 7) : (c || null));
 
 export function stateFrom(result, { strategyKey, symbol }) {
   const drawings = [];
@@ -29,13 +27,6 @@ export function stateFrom(result, { strategyKey, symbol }) {
     drawings.push({ kind: 'shape', id: `s${sec(s.t)}_${i}`, t: sec(s.t), price: s.price, dir: s.dir === 'down' ? 'down' : 'up', text: s.text || '' });
   });
 
-  const plotNames = Object.keys(result.plots || {}).slice(0, MAX_LINES);
-  for (const name of plotNames) {
-    const p = result.plots[name];
-    const pts = (p.points || []).slice(-MAX_LINE_POINTS).map(([t, v]) => ({ t: sec(t), price: v })).filter((x) => num(x.price));
-    if (pts.length >= 2) drawings.push({ kind: 'polyline', id: `l${name}`, color: cssColor(p.color), points: pts });
-  }
-
   for (const l of result.drawings?.lines || []) {
     if (num(l.p1) && l.p1 === l.p2 && levels.length < MAX_LEVELS) {
       levels.push({ id: `L${l.id}`, label: '', price: l.p1, kind: 'info', style: l.style === 'style_dashed' ? 'dashed' : l.style === 'style_dotted' ? 'dotted' : 'solid' });
@@ -48,14 +39,18 @@ export function stateFrom(result, { strategyKey, symbol }) {
     else if (levels.length < MAX_LEVELS) levels.push({ id: `T${lb.id}`, label: lb.text || '', price: lb.price, kind: 'info', style: 'dotted' });
   }
 
-  return { strategy: strategyKey, symbol, side: null, levels, drawings, ts: new Date().toISOString() };
+  const s = result.series;
+  const hasSeries = s && (s.plots?.length || s.hlines?.length || s.barcolor || s.bgcolor);
+  const series = hasSeries ? s : null;
+
+  return { strategy: strategyKey, symbol, side: null, levels, drawings, series, ts: new Date().toISOString() };
 }
 
 /** Stable fingerprint of the drawable content (ignores `ts`). */
 export function stateHash(payload) {
-  return createHash('sha1').update(JSON.stringify({ l: payload.levels, d: payload.drawings })).digest('hex');
+  return createHash('sha1').update(JSON.stringify({ l: payload.levels, d: payload.drawings, s: payload.series })).digest('hex');
 }
 
 export function emptyState({ strategyKey, symbol }) {
-  return { strategy: strategyKey, symbol, side: null, levels: [], drawings: [], ts: new Date().toISOString() };
+  return { strategy: strategyKey, symbol, side: null, levels: [], drawings: [], series: null, ts: new Date().toISOString() };
 }

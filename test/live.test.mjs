@@ -62,10 +62,13 @@ describe('stateFrom', () => {
     const shapes = s.drawings.filter((d) => d.kind === 'shape');
     expect(shapes.length).toBe(1);
     expect(shapes[0]).toMatchObject({ t: T0 / 1000, price: 99, dir: 'down', text: 'S' });
-    const line = s.drawings.find((d) => d.kind === 'polyline');
-    expect(line).toMatchObject({ id: 'lfast', color: '#FF9800' });
-    expect(line.points.length).toBe(3);
+    expect(s.drawings.some((d) => d.kind === 'polyline')).toBe(false); // plots ship as `series` now
+    expect(s.series).toBe(null); // this fixture has no series block
     expect(s.levels).toEqual([{ id: 'L1', label: 'PDH', price: 100, kind: 'info', style: 'dashed' }]);
+  });
+  it('series passes through when present', () => {
+    const s = stateFrom({ ...result, series: { times: [1], plots: [{ id: 'p0', values: [1] }], hlines: [], fills: [] } }, { strategyKey: 'k', symbol: 'NQ' });
+    expect(s.series.plots.length).toBe(1);
   });
   it('hash ignores ts', () => {
     const a = stateFrom(result, { strategyKey: 'k', symbol: 'NQ' });

@@ -122,6 +122,86 @@ return (async () => {
     plots[name] = { color: o.color || null, style: o.style || null, points, total: data.length };
   }
 
+  // Native-study series: every plot/hline/fill/barcolor/bgcolor as values
+  // aligned on ONE time axis (the last maxSeriesBars bars), plus per-bar
+  // colours as palette indexes. The chart turns this into a real TradingView
+  // study (legend, hover values, sub-pane, styles).
+  const cssColor = (c) => (typeof c === 'string' && /^#[0-9a-f]{8}$/i.test(c) ? c.slice(0, 7) : (typeof c === 'string' && c ? c : null));
+  const maxBars = Math.max(100, opts.maxSeriesBars || 3000);
+  const from = Math.max(0, n - maxBars);
+  const times = [];
+  const timeIndex = new Map();
+  for (let i = from; i < n; i++) { const t = Math.floor(md[i].openTime / 1000); timeIndex.set(t, times.length); times.push(t); }
+  const decl = ctx.indicator || (st0 => st0 && st0.config)(ctx.strategy) || {};
+  const series = {
+    overlay: !!decl.overlay, title: decl.title || null, shorttitle: decl.shorttitle || null,
+    precision: (typeof decl.precision === 'number' && decl.precision < 10) ? decl.precision : null,
+    times, plots: [], hlines: [], fills: [], barcolor: null, bgcolor: null,
+  };
+  const styleName = (s) => {
+    s = String(s || '');
+    for (const k of ['histogram', 'columns', 'areabr', 'area', 'circles', 'cross', 'stepline', 'linebr']) if (s.includes(k)) return k;
+    return 'line';
+  };
+  const paletteOf = () => { const list = []; const idx = new Map(); return { list, indexOf: (c) => { if (!c) return null; if (!idx.has(c)) { if (list.length >= 16) return null; idx.set(c, list.length); list.push(c); } return idx.get(c); } }; };
+  for (const [name, plot] of Object.entries(ctx.plots || {})) {
+    if (name.startsWith('__')) continue;
+    const o = (plot && plot.options) || {};
+    const style = String(o.style || '');
+    if (style === 'shape' || style === 'char' || style === 'candle') continue;
+    if (String(o.display || '').includes('none')) continue;
+    const data = (plot && plot.data) || [];
+    if (style === 'hline') {
+      const first = data.find((p) => p && isNum(p.value));
+      if (first) series.hlines.push({ title: plot.title || name, price: first.value, color: cssColor(o.color) || '#787b86', linestyle: String(o.linestyle || 'solid') });
+      continue;
+    }
+    if (style === 'fill') {
+      let color = cssColor(o.color);
+      if (!color) { const p = data.find((d) => d && d.options && (d.options.color || d.options.top_color)); color = p ? cssColor(p.options.color || p.options.top_color) : null; }
+      series.fills.push({ title: plot.title || name, plot1: o.plot1, plot2: o.plot2, color: color || '#2962ff' });
+      continue;
+    }
+    if (style === 'background' || style === 'barcolor') {
+      const pal = paletteOf();
+      const idx = new Array(times.length).fill(null);
+      for (const p of data) {
+        if (!p || !p.value) continue;
+        const i = timeIndex.get(Math.floor(p.time / 1000));
+        if (i === undefined) continue;
+        idx[i] = pal.indexOf(cssColor(p.options && p.options.color));
+      }
+      if (pal.list.length) series[style === 'barcolor' ? 'barcolor' : 'bgcolor'] = { palette: pal.list, idx };
+      continue;
+    }
+    // Regular plot(): values by bar, colours as a palette when they vary.
+    const values = new Array(times.length).fill(null);
+    const colorIdx = new Array(times.length).fill(null);
+    const pal = paletteOf();
+    const defaultColor = cssColor(o.color) || '#2962ff';
+    for (const p of data) {
+      if (!p) continue;
+      const i = timeIndex.get(Math.floor(p.time / 1000));
+      if (i === undefined) continue;
+      if (isNum(p.value)) values[i] = p.value;
+      const c = cssColor(p.options && p.options.color);
+      if (c) colorIdx[i] = pal.indexOf(c);
+    }
+    const multi = pal.list.length > 1 || (pal.list.length === 1 && pal.list[0] !== defaultColor);
+    series.plots.push({
+      id: 'p' + series.plots.length, key: name, title: plot.title || name,
+      style: styleName(style), color: defaultColor, linewidth: isNum(o.linewidth) ? o.linewidth : 1,
+      overlay: o.overlay === true, values, colors: multi ? { palette: pal.list, idx: colorIdx } : null,
+    });
+  }
+  // fills reference plot keys; resolve them to plot ids.
+  for (const f of series.fills) {
+    const a = series.plots.find((p) => p.key === f.plot1 || p.title === f.plot1);
+    const b = series.plots.find((p) => p.key === f.plot2 || p.title === f.plot2);
+    f.plot1 = a ? a.id : null; f.plot2 = b ? b.id : null;
+  }
+  series.fills = series.fills.filter((f) => f.plot1 && f.plot2);
+
   const st = ctx.strategy || null;
   const strat = st ? {
     config: st.config || null,
@@ -144,7 +224,7 @@ return (async () => {
     bars: n,
     firstTime: n ? md[0].openTime : null,
     lastTime: n ? md[n - 1].openTime : null,
-    plots, shapes, drawings,
+    plots, shapes, drawings, series,
     strategy: strat,
     alerts: (ctx.alerts || []).slice(0, 200),
     warnings: (ctx.warnings || []).slice(0, 50).map(String),
@@ -167,7 +247,7 @@ return (async () => {
  * @param {number} [args.memoryMb]     isolate heap limit
  * @param {number} [args.maxPlotPoints]
  */
-export async function runPine({ source, tickerId, timeframe, limit = null, sDate = null, eDate = null, symbolInfo, fetchBars, timeoutMs = 10_000, memoryMb = 128, maxPlotPoints = 3000 }) {
+export async function runPine({ source, tickerId, timeframe, limit = null, sDate = null, eDate = null, symbolInfo, fetchBars, timeoutMs = 10_000, memoryMb = 128, maxPlotPoints = 3000, maxSeriesBars = 3000 }) {
   const started = performance.now();
   const logs = [];
   const isolate = new ivm.Isolate({ memoryLimit: memoryMb });
@@ -202,7 +282,7 @@ export async function runPine({ source, tickerId, timeframe, limit = null, sDate
     await script.run(context);
     const setupMs = performance.now() - started;
 
-    const json = await context.evalClosure(RUN_CLOSURE, [source, JSON.stringify({ tickerId, timeframe, limit, sDate, eDate, symbolInfo, maxPlotPoints })], {
+    const json = await context.evalClosure(RUN_CLOSURE, [source, JSON.stringify({ tickerId, timeframe, limit, sDate, eDate, symbolInfo, maxPlotPoints, maxSeriesBars })], {
       arguments: { copy: true },
       result: { promise: true, copy: true },
     });
