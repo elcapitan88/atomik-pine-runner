@@ -54,6 +54,15 @@ describe('trade sessions', () => {
     expect(m.stats.trading.enabled).toBe(false);
   });
 
+  it('a row listed as both viz and trade on one symbol keeps the trade session, whichever comes first', async () => {
+    const viz = item({ kind: 'viz', activations: [] });
+    for (const items of [[viz, item()], [item(), viz]]) {
+      const { m } = await setup({ tradingEnabled: false, items, ledgers: [] });
+      expect(m.sessions.size).toBe(1);
+      expect(m.sessions.get('9:NQ').trading).toBe(true);
+    }
+  });
+
   it('shadow mode logs signals and persists positions but sends nothing', async () => {
     const ledgers = [
       { opentrades: [], closedtrades: [], pending_orders: [] },         // baseline (bar 3)

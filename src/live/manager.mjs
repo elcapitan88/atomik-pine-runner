@@ -103,7 +103,13 @@ export class LiveManager {
         const symbol = tickerToRoot(it.symbol);
         const timeframe = SUPPORTED_TIMEFRAMES.includes(it.timeframe) ? it.timeframe : '5m';
         if (!symbol || !it.source || !it.strategy_key) continue;
-        wanted.set(`${it.strategy_code_id}:${symbol}`, { ...it, symbol, timeframe });
+        const key = `${it.strategy_code_id}:${symbol}`;
+        // One session per (row, symbol). The backend lists a row once per kind,
+        // so a row both drawn and traded on one symbol arrives twice: the trade
+        // item wins (it draws too; a viz item can never trade).
+        const prev = wanted.get(key);
+        if (prev && prev.kind === 'trade' && it.kind !== 'trade') continue;
+        wanted.set(key, { ...it, symbol, timeframe });
       }
       // Drop sessions that are gone (clear their drawings on the chart).
       for (const [key, s] of this.sessions) {
