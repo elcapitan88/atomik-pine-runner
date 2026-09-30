@@ -1,11 +1,15 @@
 // Live chart indicators. One session per (StrategyCode, symbol) the backend
 // reports as active; each session keeps a bar history (warehouse warmup +
-// closed live bars), re-runs the script in the sandbox on every closed bar,
-// and publishes the resulting drawings when they change.
+// closed live bars), runs the script on every closed bar and on the forming
+// bar, and publishes the resulting drawings when they change.
 //
-// Re-running from history on each bar (instead of streaming inside PineTS) is
-// deliberate: it's a few ms per run, it makes `var` state identical to a
-// backtest over the same bars, and a restart loses nothing.
+// STREAMING (default): each session's script stays open in a StreamHost
+// isolate and an update re-executes only the last bar or two (milliseconds),
+// with an exact rollback between ticks (see PineStream in sandbox.mjs). The
+// parity tests prove a streamed session ends in the same state as a one-shot
+// run over the same bars. Any stream failure reopens it from history; a
+// session whose stream keeps failing, or that finds no stream capacity, falls
+// back to the stateless path: re-run the whole history on every update.
 import { BarAggregator, mergeBar } from './bars.mjs';
 import { DataHubFeed } from './datahub.mjs';
 import { StateBus } from './redis.mjs';
@@ -19,9 +23,10 @@ import * as warehouse from '../warehouse.mjs';
 const liveKey = (s) => `pine_trading:${s.id}:${s.symbol}`;
 
 export class LiveManager {
-  constructor({ config, pool, log = console, fetchImpl = fetch, warehouseImpl = warehouse }) {
+  constructor({ config, pool, streams = null, log = console, fetchImpl = fetch, warehouseImpl = warehouse }) {
     this.config = config;
     this.pool = pool;
+    this.streams = streams;
     this.log = log;
     this.fetch = fetchImpl;
     this.warehouse = warehouseImpl;
@@ -70,9 +75,11 @@ export class LiveManager {
     return {
       sessions: [...this.sessions.values()].map((s) => ({
         key: s.key, symbol: s.symbol, timeframe: s.timeframe, bars: s.bars.length, runs: s.runs, intrabarRuns: s.intrabarRuns, intrabarMs: s.intrabarMs, lastRunMs: s.lastRunMs, lastBoundaryMs: s.lastBoundaryMs ?? null, lastError: s.lastError,
+        stream: this.streams ? { on: s.streamed, opens: s.streamOpens, bars: s.streamBars, heapMb: s.heapMb, off: s.streamOff || null, failures: s.streamFailures } : null,
         trading: s.trading ? { strategy: s.strategyName, activations: s.activations.length, live_accounts: s.activations.filter((a) => !a.is_paper).length, positions: liveSnapshot(s.ledger), shadow: s.shadowSignals, sent: s.signalsSent, failed: s.signalsFailed, lastLatencyMs: s.lastLatencyMs, recent: s.signalLog.slice(-10) } : null,
       })),
       trading: { enabled: !!this.config.tradingEnabled, execution: this.execution.stats },
+      streams: this.streams ? this.streams.stats : null,
       feed: this.feed.stats,
       bus: this.bus.stats,
       lastSync: this.lastSync,
@@ -115,6 +122,7 @@ export class LiveManager {
       for (const [key, s] of this.sessions) {
         if (!wanted.has(key)) {
           this.sessions.delete(key);
+          this.streams?.closeStream(key);
           await this.bus.publishState(emptyState({ strategyKey: s.strategyKey, symbol: s.symbol }));
           this.log.info?.(`live: dropped ${key}`);
         }
@@ -135,6 +143,7 @@ export class LiveManager {
         const s = {
           key, id: it.strategy_code_id, strategyKey: it.strategy_key, symbol: it.symbol, timeframe: it.timeframe, seconds: atomikToSeconds(it.timeframe), source: it.source, symbolInfo: it.symbol_info || null,
           bars: [], warmed: false, runs: 0, intrabarRuns: 0, lastRunMs: null, lastError: null, lastHash: null, lastPayload: null, lastPartialHash: null, running: false, pending: false, wantBoundary: false, closedPending: false, closedAt: 0, dirty: false, lastIntrabarAt: 0, triggerAt: 0, intrabarMs: (this.config.liveIntrabarSeconds || 5) * 1000, intrabarNeeded: false,
+          streamed: false, streamLast: null, streamBars: 0, streamOpens: 0, streamFailures: 0, streamOff: false, streamRetryAt: 0, heapMb: null,
           trading, activations, strategyName: it.strategy_name || null, ledger: newLedgerState(), outbox: Promise.resolve(), shadowSignals: 0, signalsSent: 0, signalsFailed: 0, signalLog: [], lastLatencyMs: null,
         };
         if (cur) { s.ledger = cur.ledger; s.shadowSignals = cur.shadowSignals; s.signalsSent = cur.signalsSent; s.signalsFailed = cur.signalsFailed; s.signalLog = cur.signalLog; s.outbox = cur.outbox; }
@@ -231,19 +240,22 @@ export class LiveManager {
 
   /** Once a second: sessions whose symbol traded re-run on the forming bar,
    * no more often than their interval, stretched to 3x the last run time so
-   * a slow script can't monopolise the workers. Charts get the configured
-   * cadence; a trading session drops to 1s only while its ledger has orders
-   * that can fill mid-bar (resting stop/limit entries, trailing exits), since
-   * everything else is decided by the boundary run. Every re-run is a full
-   * recompute, and on a shared CPU a tight loop burns the burst budget and
-   * makes EVERY run slower — so idle is the default. */
+   * a slow script can't monopolise the workers. A STREAMED session updates in
+   * milliseconds, so it runs at the stream cadence (1s by default). A
+   * stateless session re-runs its whole history each time: charts get the
+   * configured cadence, and a trading session drops to 1s only while its
+   * ledger has orders that can fill mid-bar (resting stop/limit entries,
+   * trailing exits), since everything else is decided by the boundary run. On
+   * a shared CPU a tight full-recompute loop burns the burst budget and makes
+   * EVERY run slower — so idle is the stateless default. */
   #intrabarTick() {
     this.#flushClosed(1000);
     const now = Date.now();
     const chartFloor = (this.config.liveIntrabarSeconds || 5) * 1000;
+    const streamFloor = this.config.liveStreamIntrabarMs || 1000;
     for (const s of this.sessions.values()) {
       if (!s.warmed || !s.dirty || s.running || s.closedPending) continue;
-      const floor = s.trading && s.intrabarNeeded ? 1000 : chartFloor;
+      const floor = s.streamed ? streamFloor : s.trading && s.intrabarNeeded ? 1000 : chartFloor;
       s.intrabarMs = Math.max(floor, 3 * (s.lastRunMs || 0));
       if (now - s.lastIntrabarAt < s.intrabarMs) continue;
       const forming = this.aggregators.get(`${s.symbol}:${s.seconds}`)?.forming;
@@ -304,13 +316,9 @@ export class LiveManager {
         // last bars' chart values like an intrabar run; the closed history
         // gets its full, cached frame from the follow-up run queued below.
         const chartFull = isFull && !boundary;
-        const bars = f ? [...s.bars, f] : s.bars;
         const triggerAt = s.triggerAt || Date.now();
         const started = Date.now();
-        const res = await this.pool.run(
-          { type: 'live_run', source: s.source, symbol: s.symbol, timeframe: s.timeframe, bars, symbol_info: s.symbolInfo, max_series_bars: chartFull ? this.config.liveWarmupBars : 2 },
-          { timeoutMs: this.config.liveRunTimeoutMs, priority: !!s.trading },
-        );
+        const res = await this.#execute(s, f, chartFull ? this.config.liveWarmupBars : 2);
         s.lastRunMs = Date.now() - started;
         if (isFull) s.runs++; else s.intrabarRuns++;
         if (boundary) { s.lastBoundaryMs = s.lastRunMs; s.pending = true; }
@@ -362,6 +370,83 @@ export class LiveManager {
     } finally {
       s.running = false;
     }
+  }
+
+  /**
+   * Run the script for this session: through its stream when streaming is on,
+   * else (or when the stream fails) as a stateless full re-run in the pool.
+   * `forming` is the forming bar (newer than every closed bar) or null.
+   */
+  async #execute(s, forming, maxSeries) {
+    let streamFailed = false;
+    if (this.streams && !s.streamOff && Date.now() >= s.streamRetryAt) {
+      const res = await this.#streamRun(s, forming, maxSeries);
+      if (res.ok) { s.streamFailures = 0; return res; }
+      s.streamed = false;
+      if (res.capacity) {
+        s.streamRetryAt = Date.now() + 300_000;
+        this.log.warn?.(`live: ${s.key} no stream capacity (${res.detail}); full re-runs for now`);
+      } else {
+        streamFailed = true;
+        s.streamFailures++;
+        this.log.warn?.(`live: ${s.key} stream failed (${res.detail}); full re-run`);
+      }
+    }
+    const bars = forming ? [...s.bars, forming] : s.bars;
+    const res = await this.pool.run(
+      { type: 'live_run', source: s.source, symbol: s.symbol, timeframe: s.timeframe, bars, symbol_info: s.symbolInfo, max_series_bars: maxSeries },
+      { timeoutMs: this.config.liveRunTimeoutMs, priority: !!s.trading },
+    );
+    if (streamFailed) {
+      if (!res.ok) {
+        // The script itself fails: not the stream's fault. Don't count it,
+        // and don't pay for a second failing run on every update for a while.
+        s.streamFailures = Math.max(0, s.streamFailures - 1);
+        s.streamRetryAt = Date.now() + 60_000;
+      } else if (s.streamFailures >= 3) {
+        s.streamOff = true;
+        this.log.warn?.(`live: ${s.key} streaming OFF after ${s.streamFailures} stream-only failures; full re-runs from now on`);
+      }
+    }
+    return res;
+  }
+
+  /**
+   * Advance the session's stream with every bar from the stream's last bar on
+   * (that bar itself, now final or still forming, plus newer closed bars and
+   * the forming bar), or open it from history when it has none. A stream that
+   * has grown `liveStreamRecycleBars` past the warmup is reopened on a closed
+   * bar so its history stays bounded.
+   */
+  async #streamRun(s, forming, maxSeries) {
+    const timeoutMs = this.config.liveRunTimeoutMs;
+    const recycle = s.streamed && !forming && s.streamBars >= this.config.liveWarmupBars + (this.config.liveStreamRecycleBars || 2000);
+    if (s.streamed && !recycle) {
+      const tail = [];
+      for (let i = s.bars.length - 1; i >= 0 && s.bars[i].openTime >= s.streamLast; i--) tail.unshift(s.bars[i]);
+      if (forming) tail.push(forming);
+      const newBar = tail.some((b) => b.openTime > s.streamLast);
+      const res = await this.streams.update(s.key, { bars: tail, new_bar: newBar, max_series_bars: maxSeries, timeout_ms: timeoutMs }, { timeoutMs });
+      if (res.ok) {
+        if (tail.length) s.streamLast = tail[tail.length - 1].openTime;
+        s.streamBars = res.live.bars;
+        s.heapMb = res.heap_mb ?? s.heapMb;
+        return res;
+      }
+      if (!res.stream_missing && !res.stream_lost) return res;
+      this.log.info?.(`live: ${s.key} stream lost (${res.detail}); reopening from history`);
+      s.streamed = false;
+    }
+    const bars = forming ? [...s.bars, forming] : s.bars;
+    const res = await this.streams.open(s.key, { source: s.source, symbol: s.symbol, timeframe: s.timeframe, bars, symbol_info: s.symbolInfo, max_series_bars: maxSeries, timeout_ms: timeoutMs }, { timeoutMs });
+    if (res.ok) {
+      s.streamed = true;
+      s.streamOpens++;
+      s.streamLast = bars.length ? bars[bars.length - 1].openTime : null;
+      s.streamBars = res.live.bars;
+      s.heapMb = res.heap_mb ?? null;
+    }
+    return res;
   }
 
   /**

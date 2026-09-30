@@ -18,9 +18,14 @@ warehouse.connect(config.timescaleUrl);
 // all three the service is backtest-only.
 const liveConfigured = config.liveEnabled && config.datahubWsUrl && config.datahubApiKey && config.redisUrl;
 let live = null;
+let streams = null;
 if (liveConfigured) {
   const { LiveManager } = await import('./live/manager.mjs');
-  live = new LiveManager({ config, pool, log: app.log });
+  if (config.liveStreaming) {
+    const { StreamHost } = await import('./streams.mjs');
+    streams = new StreamHost({ size: config.streamWorkers, maxStreams: config.maxStreams, log: app.log });
+  }
+  live = new LiveManager({ config, pool, streams, log: app.log });
   live.start().catch((err) => app.log.error(`live manager failed to start: ${err.message}`));
 } else {
   app.log.warn('live chart indicators disabled (DATAHUB_WS_URL, DATAHUB_API_KEY, REDIS_URL needed)');
@@ -81,6 +86,7 @@ async function shutdown(signal) {
   app.log.info(`${signal}: shutting down`);
   await app.close();
   if (live) await live.stop();
+  if (streams) await streams.close();
   await pool.close();
   await warehouse.close();
   // No process.exit(): let killed isolates finish tearing down (a hard exit

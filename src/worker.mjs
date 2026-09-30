@@ -1,8 +1,11 @@
 // Sandbox worker: one child process that fetches bars, runs the isolate and
 // translates the result. A native crash here loses this worker, not the API.
-// Messages: {id, type: 'compile'|'backtest', ...} -> {id, ok, ...}.
+// Messages: {id, type: 'compile'|'backtest'|'live_run', ...} -> {id, ok, ...}.
+// A worker forked by the StreamHost also holds live STREAMS (one isolate per
+// session, kept between updates): 'stream_open' | 'stream_update' | 'stream_close'.
 import { config } from './config.mjs';
-import { runPine } from './sandbox.mjs';
+import { runPine, PineStream } from './sandbox.mjs';
+import { mergeBar } from './live/bars.mjs';
 import { toBacktestPayload } from './translate.mjs';
 import * as warehouse from './warehouse.mjs';
 import { tickerToRoot } from './symbols.mjs';
@@ -133,29 +136,40 @@ async function cachedFetchBars(tickerId, tf, limit, sDate, eDate) {
   return bars;
 }
 
-async function liveRun(job) {
-  const pineTf = atomikToPine(job.timeframe);
-  if (!pineTf) return { ok: false, status: 400, detail: `Unsupported timeframe '${job.timeframe}'.` };
-  const primary = job.bars || [];
-  const wantSeconds = atomikToSeconds(job.timeframe);
-  const provider = async (tickerId, tf, limit, sDate, eDate) => {
+// The session's own series (symbol + timeframe) is served from `getBars()`;
+// every other symbol/timeframe (request.security) from the warehouse.
+function chartProvider(symbol, timeframe, getBars) {
+  const wantSeconds = atomikToSeconds(timeframe);
+  return async (tickerId, tf, limit, sDate, eDate) => {
     const root = tickerToRoot(tickerId);
-    if (root === job.symbol && pineToSeconds(tf) === wantSeconds) {
-      let bars = primary;
-      if (sDate != null) bars = bars.filter((b) => b.openTime >= sDate);
+    if (root === symbol && pineToSeconds(tf) === wantSeconds) {
+      let bars = getBars();
+      if (sDate != null) {
+        let i = bars.length;
+        while (i > 0 && bars[i - 1].openTime >= sDate) i--;
+        bars = bars.slice(i);
+      }
       if (eDate != null) bars = bars.filter((b) => b.openTime <= eDate);
       if (limit) bars = bars.slice(-limit);
       return bars;
     }
     return cachedFetchBars(tickerId, tf, limit, sDate, eDate);
   };
+}
+
+const liveFields = (res) => ({ kind: res.kind, title: res.title, bars: res.bars, lastTime: res.lastTime, plots: res.plots, shapes: res.shapes, drawings: res.drawings, series: res.series, strategy: res.strategy, ms: res.ms });
+
+async function liveRun(job) {
+  const pineTf = atomikToPine(job.timeframe);
+  if (!pineTf) return { ok: false, status: 400, detail: `Unsupported timeframe '${job.timeframe}'.` };
+  const primary = job.bars || [];
   const res = await runPine({
     source: job.source,
     tickerId: job.symbol,
     timeframe: pineTf,
     limit: primary.length,
     symbolInfo: symbolInfoFor(job.symbol, job.symbol_info),
-    fetchBars: provider,
+    fetchBars: chartProvider(job.symbol, job.timeframe, () => primary),
     timeoutMs: config.liveRunTimeoutMs,
     memoryMb: config.isolateMemoryMb,
     maxPlotPoints: 400,
@@ -164,8 +178,80 @@ async function liveRun(job) {
     maxSeriesBars: Number.isFinite(job.max_series_bars) && job.max_series_bars > 0 ? job.max_series_bars : config.liveWarmupBars,
   });
   if (!res.ok) return { ok: false, status: 400, detail: res.reason === 'data' ? res.error : `Script error: ${cleanError(res.error)}` };
-  return { ok: true, live: { kind: res.kind, title: res.title, bars: res.bars, lastTime: res.lastTime, plots: res.plots, shapes: res.shapes, drawings: res.drawings, series: res.series, strategy: res.strategy, ms: res.ms } };
+  return { ok: true, live: liveFields(res) };
 }
+
+// Live streams: key -> {stream, bars}. `bars` is the session's series as this
+// worker knows it; each update merges the bars the manager sends (the last
+// known bar, now final or still forming, plus any newer ones) and the stream
+// re-executes only from there.
+const streams = new Map();
+const STREAM_BAR_CAP = 20_000;
+// Closed trades per update: enough to cover every trade that could have
+// closed since the previous update; the ledger diff already knows the rest.
+const STREAM_UPDATE_CLOSED_TRADES = 200;
+
+function closeStream(key) {
+  const entry = streams.get(key);
+  streams.delete(key);
+  entry?.stream?.dispose();
+}
+
+const liveError = (res) => (res.reason === 'data' ? res.error : res.reason === 'timeout' ? `Script timed out after ${res.ms}ms` : `Script error: ${cleanError(res.error)}`);
+
+async function streamOpen(job) {
+  const pineTf = atomikToPine(job.timeframe);
+  if (!pineTf) return { ok: false, status: 400, detail: `Unsupported timeframe '${job.timeframe}'.` };
+  closeStream(job.key);
+  const entry = { bars: (job.bars || []).slice(-STREAM_BAR_CAP), stream: null };
+  const res = await PineStream.open({
+    source: job.source,
+    tickerId: job.symbol,
+    timeframe: pineTf,
+    limit: entry.bars.length,
+    symbolInfo: symbolInfoFor(job.symbol, job.symbol_info),
+    fetchBars: chartProvider(job.symbol, job.timeframe, () => entry.bars),
+    timeoutMs: job.timeout_ms || config.liveRunTimeoutMs,
+    memoryMb: config.isolateMemoryMb,
+    maxPlotPoints: 400,
+    maxSeriesBars: Number.isFinite(job.max_series_bars) && job.max_series_bars > 0 ? job.max_series_bars : config.liveWarmupBars,
+  });
+  if (!res.ok) return { ok: false, status: 400, detail: liveError(res) };
+  entry.stream = res.stream;
+  streams.set(job.key, entry);
+  return { ok: true, live: liveFields(res), heap_mb: res.stream.heapMb() };
+}
+
+async function streamUpdate(job) {
+  const entry = streams.get(job.key);
+  if (!entry || !entry.stream.alive) {
+    closeStream(job.key);
+    return { ok: false, status: 409, stream_missing: true, detail: 'stream is not open' };
+  }
+  for (const b of job.bars || []) mergeBar(entry.bars, b, STREAM_BAR_CAP);
+  const res = await entry.stream.update({
+    newBar: !!job.new_bar,
+    maxSeriesBars: Number.isFinite(job.max_series_bars) && job.max_series_bars > 0 ? job.max_series_bars : 2,
+    maxClosedTrades: STREAM_UPDATE_CLOSED_TRADES,
+    timeoutMs: job.timeout_ms || config.liveRunTimeoutMs,
+  });
+  if (!res.ok) {
+    // The stream is disposed on any failure: its state is not trustworthy
+    // after a bar that threw halfway. The manager reopens it from history.
+    closeStream(job.key);
+    return { ok: false, status: 400, stream_lost: true, detail: liveError(res) };
+  }
+  return { ok: true, live: liveFields(res), heap_mb: entry.stream.heapMb() };
+}
+
+const HANDLERS = {
+  compile,
+  backtest,
+  live_run: liveRun,
+  stream_open: streamOpen,
+  stream_update: streamUpdate,
+  stream_close: async (job) => { closeStream(job.key); return { ok: true }; },
+};
 
 function defaultSymbolInfo(symbol) {
   return {
@@ -187,16 +273,18 @@ function symbolInfoFor(symbol, partial) {
 process.on('message', async (job) => {
   let reply;
   try {
-    reply = job.type === 'compile' ? await compile(job) : job.type === 'live_run' ? await liveRun(job) : await backtest(job);
+    const handler = HANDLERS[job.type] || backtest;
+    reply = await handler(job);
   } catch (err) {
     reply = { ok: false, status: 500, detail: `worker failure: ${String(err?.message || err).slice(0, 300)}` };
   }
-  process.send({ id: job.id, ...reply });
+  if (process.connected) process.send({ id: job.id, ...reply }, () => {});
 });
 
 process.on('disconnect', async () => {
+  for (const key of [...streams.keys()]) closeStream(key);
   await warehouse.close();
   process.exitCode = 0;
 });
 
-process.send?.({ ready: true });
+if (process.connected) process.send({ ready: true }, () => {});

@@ -40,6 +40,19 @@ export const config = {
   // Every re-run is a full recompute; on a shared-CPU machine a tight cadence
   // burns the burst budget and slows every run down, so the default is loose.
   liveIntrabarSeconds: int('PINE_LIVE_INTRABAR_SECONDS', 5),
+  // Streaming: each live session's script stays open in a dedicated stream
+  // worker and an update re-executes only the last bar or two. Off = every
+  // update is a full re-run (the settings above).
+  liveStreaming: (env.PINE_LIVE_STREAMING || 'true') === 'true',
+  streamWorkers: int('PINE_STREAM_WORKERS', 1),
+  // Each open stream holds an isolate (~40MB RSS at 5,000 bars); beyond this, sessions
+  // fall back to full re-runs.
+  maxStreams: int('PINE_MAX_STREAMS', 8),
+  // Forming-bar cadence for streamed sessions (an update costs milliseconds).
+  liveStreamIntrabarMs: int('PINE_LIVE_STREAM_INTRABAR_MS', 1000),
+  // Reopen a stream from history once it has grown this many bars past the
+  // warmup, so its memory stays bounded.
+  liveStreamRecycleBars: int('PINE_LIVE_STREAM_RECYCLE_BARS', 2000),
   liveSyncSeconds: int('PINE_LIVE_SYNC_SECONDS', 30),
   liveRunTimeoutMs: int('PINE_LIVE_RUN_TIMEOUT_MS', 20_000),
   // Re-publish unchanged state this often so a chart opened between bar closes

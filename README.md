@@ -16,9 +16,10 @@ interact with.
   trades, metrics, an equity curve and chart output, in the same shape as Atomik's Python backtests.
 - `GET /health`
 - Live chart indicators (`src/live/`): every Pine script the backend reports as "shown on a chart"
-  gets a session that warms up from the warehouse, aggregates DataHub trades into bars, re-runs the
-  script on each closed bar, and publishes its plots, markers, boxes and levels to Redis
-  (`strategy_state:{strategy}:{symbol}`), where Atomik's WebSocket relay forwards them to the chart.
+  gets a session that warms up from the warehouse, aggregates DataHub trades into bars, keeps the
+  script running as a stream (see "Streaming" below), and publishes its plots, markers, boxes and
+  levels to Redis (`strategy_state:{strategy}:{symbol}`), where Atomik's WebSocket relay forwards
+  them to the chart.
 
 Both `/v1` routes need `X-API-Key: <PINE_RUNNER_KEY>`. The service is reached only over Fly's private
 network; it never faces the internet.
@@ -60,7 +61,12 @@ HTTP request ─▶ server.mjs (auth, validation) ─▶ pool.mjs ─▶ worker.
 | `REDIS_URL` | — | where chart state is published (live indicators) |
 | `BACKEND_INTERNAL_URL` | `http://atomik-backend.internal:8000` | lists the scripts to run live |
 | `PINE_LIVE_WARMUP_BARS` | `5000` | history each live session keeps (and ships to the chart) |
-| `PINE_LIVE_INTRABAR_SECONDS` | `5` | min seconds between forming-bar re-runs per chart session (trading sessions drop to 1s only while an order can fill mid-bar) |
+| `PINE_LIVE_STREAMING` | `true` | keep each live session's script open and update it incrementally; `false` = full re-run on every update |
+| `PINE_STREAM_WORKERS` | `1` | processes holding the live streams (separate from `PINE_WORKERS`) |
+| `PINE_MAX_STREAMS` | `8` | open streams (~40MB each); sessions beyond it use full re-runs |
+| `PINE_LIVE_STREAM_INTRABAR_MS` | `1000` | min ms between forming-bar updates of a streamed session |
+| `PINE_LIVE_STREAM_RECYCLE_BARS` | `2000` | reopen a stream from history once it grew this many bars past the warmup |
+| `PINE_LIVE_INTRABAR_SECONDS` | `5` | min seconds between forming-bar re-runs of a NON-streamed session (trading sessions drop to 1s only while an order can fill mid-bar) |
 | `PINE_LIVE_HEARTBEAT_SECONDS` | `60` | full-state re-publish so open charts catch up |
 | `PINE_TRADING_ENABLED` | `false` | send signals for activated strategies; unset = shadow mode (signals are only logged) |
 | `EXECUTION_API_KEY` | `DATAHUB_API_KEY` | key for the backend's signal endpoint (the strategy engine's key) |
@@ -101,7 +107,37 @@ a trading session re-runs mid-bar (1s cadence) only while its ledger holds somet
 mid-bar: a resting stop/limit entry, a trailing exit, or `calc_on_every_tick=true`. Every re-run is
 a full recompute of the history; on a shared-CPU machine a tight loop exhausts the CPU burst
 budget and slows every run down, which is why idle is the default and a dedicated CPU is the
-right machine for trading.
+right machine for trading. Streaming (below) removes the recompute.
+
+## Streaming
+
+A full re-run replays the whole history (5,000 bars: 0.4–2s per run at idle, ~10x that on a
+throttled shared CPU) to change the last bar. Instead each live session keeps its script OPEN in
+a stream worker (`streams.mjs`, separate from the backtest pool so a backtest never delays a tick)
+and an update re-executes only the last bar or two: 2–25ms for real strategies at 5,000 bars.
+
+It uses PineTS's own live mode (a paginated `run()` with a provider and no end date), plus fixes
+for what that mode gets wrong (`PineStream` in `sandbox.mjs`):
+
+- **Exact rollback.** Between ticks PineTS restores which object each `var` points to, but not what
+  is inside it, so `array.push`, `map.put`, `udt.field :=`, `box.delete` on a forming bar survive
+  and pile up once per tick. The stream also snapshots every mutable object reachable from the
+  script's variables, `ta` state and drawing helpers, and restores each one in place.
+- **`request.security`.** PineTS refreshes a cached secondary with `updateTail()`, which shifts the
+  secondary's per-bar value arrays by a slot per update (higher-timeframe values go stale). The
+  stream rebuilds the secondary from fresh data instead (small: higher-timeframe history).
+- **`barstate.isnew`** is true on a bar's first tick only, like TradingView (PineTS latches it off).
+- `plot()` points re-pushed for the same bar are compacted.
+
+`test/stream.test.mjs` proves each of these: a stream fed bar by bar, three ticks per bar, ends in
+the same state (trades, pending orders, plot values, markers, boxes, lines) as a one-shot run over
+the same bars. `test/private-parity.test.mjs` runs the same check on the real scripts in
+`private-fixtures/` when present.
+
+Any stream failure disposes the stream (its state is not trustworthy after a bar that threw) and
+the session reopens it from history; a session whose stream fails 3 times on its own, or that
+finds no stream capacity, falls back to full re-runs. `/health` shows `live.streams` and each
+session's `stream` block (opens, bars, heap).
 
 ## Development
 
