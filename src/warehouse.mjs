@@ -45,22 +45,28 @@ export async function getBars(symbol, timeframe, startMs, endMs, limit = null) {
   const seconds = atomikToSeconds(timeframe);
   if (!seconds) throw new TimeframeUnsupported(`timeframe ${timeframe} is not served by the warehouse`);
 
-  const start = new Date(startMs);
-  const end = new Date(endMs);
+  // Either bound may be null ("newest `limit` bars" needs no range and must not
+  // pay for a min/max scan of the hypertable to invent one).
+  const params = [symbol];
+  const bounds = (col) => {
+    let where = '';
+    if (startMs != null) { params.push(new Date(startMs)); where += ` AND ${col} >= $${params.length}`; }
+    if (endMs != null) { params.push(new Date(endMs)); where += ` AND ${col} < $${params.length}`; }
+    return where;
+  };
   let sql;
-  let params;
   if (RELATIONS[timeframe]) {
     const [table, col] = RELATIONS[timeframe];
     sql = `SELECT extract(epoch FROM ${col}) * 1000 AS t, open, high, low, close, volume
-           FROM ${table} WHERE symbol = $1 AND ${col} >= $2 AND ${col} < $3 ORDER BY 1 ASC`;
-    params = [symbol, start, end];
+           FROM ${table} WHERE symbol = $1${bounds(col)} ORDER BY 1 ASC`;
   } else {
-    sql = `SELECT extract(epoch FROM time_bucket(make_interval(secs => $4), ts)) * 1000 AS t,
+    const where = bounds('ts');
+    params.push(seconds);
+    sql = `SELECT extract(epoch FROM time_bucket(make_interval(secs => $${params.length}), ts)) * 1000 AS t,
                   first(open, ts) AS open, max(high) AS high, min(low) AS low,
                   last(close, ts) AS close, sum(volume) AS volume
-           FROM bars WHERE symbol = $1 AND ts >= $2 AND ts < $3
+           FROM bars WHERE symbol = $1${where}
            GROUP BY 1 ORDER BY 1 ASC`;
-    params = [symbol, start, end, seconds];
   }
   if (limit && limit > 0) {
     // Newest `limit` bars, still returned ascending.

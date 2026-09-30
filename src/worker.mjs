@@ -31,15 +31,8 @@ async function fetchBars(tickerId, pineTf, limit, sDate, eDate) {
   const tf = seconds ? secondsToAtomik(seconds) : null;
   if (!tf) throw new ScriptError(`Timeframe "${pineTf}" is not available for backtesting. Available: 1, 2, 3, 5, 10, 15, 30, 60, 120, 240, D.`);
   if (synthetic) return synthetic(root, pineTf, limit, sDate, eDate);
-  let start = sDate ?? null;
-  let end = eDate ?? null;
-  if (start == null || end == null) {
-    const cov = await warehouse.coverage(root);
-    if (cov.min == null) throw new ScriptError(`No historical data for ${root}.`);
-    if (start == null) start = cov.min;
-    if (end == null) end = cov.max + 1;
-  }
-  return warehouse.getBars(root, tf, start, end, limit);
+  // Open bounds are fine: "newest N bars" (compile dry-run) needs no range.
+  return warehouse.getBars(root, tf, sDate ?? null, eDate ?? null, limit);
 }
 
 function parseLine(message) {
@@ -62,7 +55,7 @@ async function compile(job) {
     tickerId: symbol,
     timeframe: atomikToPine(tf) || '5',
     limit: config.compileBars,
-    symbolInfo: job.symbol_info || defaultSymbolInfo(symbol),
+    symbolInfo: symbolInfoFor(symbol, job.symbol_info),
     fetchBars,
     timeoutMs: config.compileTimeoutMs,
     memoryMb: config.isolateMemoryMb,
@@ -102,7 +95,7 @@ async function backtest(job) {
     timeframe: pineTf,
     sDate: job.start_ms,
     eDate: job.end_ms,
-    symbolInfo: job.symbol_info || defaultSymbolInfo(job.symbol),
+    symbolInfo: symbolInfoFor(job.symbol, job.symbol_info),
     fetchBars,
     timeoutMs: config.backtestTimeoutMs,
     memoryMb: config.isolateMemoryMb,
@@ -125,6 +118,15 @@ function defaultSymbolInfo(symbol) {
     mintick: 0.25, minmove: 1, pricescale: 100, pointvalue: 1, currency: 'USD', basecurrency: '',
     timezone: 'America/Chicago', session: '1700-1600', volumetype: 'base',
   };
+}
+
+// A caller may send only the fields it knows (tick size, point value). Every
+// other syminfo.* field must still exist: `request.security(syminfo.tickerid, ...)`
+// with an undefined tickerid fails deep inside PineTS with "Invalid timeframe".
+function symbolInfoFor(symbol, partial) {
+  const merged = { ...defaultSymbolInfo(symbol) };
+  for (const [k, v] of Object.entries(partial || {})) if (v !== null && v !== undefined && v !== '') merged[k] = v;
+  return merged;
 }
 
 process.on('message', async (job) => {

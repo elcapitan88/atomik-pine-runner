@@ -102,6 +102,13 @@ describe('POST /v1/backtest', () => {
     expect(j.fill_fidelity).toBe('pinets_bar_emulator');
     expect(j.custom_metrics.runtime).toBe('pinets');
   });
+  it('request.security works with a partial symbol_info', async () => {
+    const source = SCRIPTS.ema_cross_strategy.replace('plot(f, "fast")', 'plot(request.security(syminfo.tickerid, "60", ta.ema(close, 20)), "h1")');
+    const r = await post('/v1/backtest', { source, symbol: 'NQ', timeframe: '5m', start: '2026-06-02', end: '2026-06-16', symbol_info: { mintick: 0.25, pointvalue: 20 } });
+    expect(r.status).toBe(200);
+    const j = await r.json();
+    expect(j.chart.plots.find((p) => p.name === 'h1').data.length).toBeGreaterThan(100);
+  });
   it('indicator is not backtestable', async () => {
     const r = await post('/v1/backtest', { source: SCRIPTS.fvg_boxes, symbol: 'NQ', timeframe: '5m', start: '2026-06-02', end: '2026-06-10' });
     expect(r.status).toBe(400);
