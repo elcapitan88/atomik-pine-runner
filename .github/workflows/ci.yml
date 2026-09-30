@@ -9,6 +9,10 @@ jobs:
   sandbox:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        kill: [both, timeout, memory, none]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -17,3 +21,5 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run spike
+        env:
+          SPIKE_KILL: ${{ matrix.kill }}

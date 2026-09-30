@@ -114,6 +114,13 @@ function check(name, pass, detail) {
   console.log(`${pass ? 'PASS' : 'FAIL'}  ${name}  ${detail}`);
 }
 
+// SPIKE_KILL selects which force-kill probes run: both (default) | timeout | memory | none.
+// Used to find which isolate teardown path misbehaves on a given platform.
+const KILL = process.env.SPIKE_KILL || 'both';
+if (!['both', 'timeout'].includes(KILL)) delete S.probe_pine_nested_loops;
+if (!['both', 'memory'].includes(KILL)) delete S.probe_memory_bomb;
+console.log(`SPIKE_KILL=${KILL}`);
+
 const r = {};
 for (const [name, src] of Object.entries(S)) {
   const timeoutMs = name.startsWith('probe_') ? 5_000 : 30_000;
@@ -129,8 +136,12 @@ check('v6 types/maps/while', r.v6_types_maps_while.ok, r.v6_types_maps_while.err
 check('process.env NOT readable', !r.probe_env_read.ok || !(r.probe_env_read.plots?.len > 0), r.probe_env_read.error || JSON.stringify(r.probe_env_read.plots));
 check('no Node/web globals in isolate', r.probe_js_mode.ok && r.probe_js_mode.probe === 'undefined,undefined,undefined,undefined,undefined', `probe=${r.probe_js_mode.probe} ${r.probe_js_mode.error || ''}`);
 check('raw JS infinite loop stopped', !r.probe_js_infinite_loop.ok && r.probe_js_infinite_loop.ms < 8_000, `reason=${r.probe_js_infinite_loop.reason} ms=${r.probe_js_infinite_loop.ms}`);
-check('Pine nested loops killed by wall-clock timeout', r.probe_pine_nested_loops.reason === 'timeout' && r.probe_pine_nested_loops.ms < 8_000, `reason=${r.probe_pine_nested_loops.reason} ms=${r.probe_pine_nested_loops.ms} ${r.probe_pine_nested_loops.error || ''}`);
-check('memory bomb contained', !r.probe_memory_bomb.ok, `reason=${r.probe_memory_bomb.reason} ${r.probe_memory_bomb.error || ''}`);
+if (r.probe_pine_nested_loops) {
+  check('Pine nested loops killed by wall-clock timeout', r.probe_pine_nested_loops.reason === 'timeout' && r.probe_pine_nested_loops.ms < 8_000, `reason=${r.probe_pine_nested_loops.reason} ms=${r.probe_pine_nested_loops.ms} ${r.probe_pine_nested_loops.error || ''}`);
+}
+if (r.probe_memory_bomb) {
+  check('memory bomb contained', !r.probe_memory_bomb.ok, `reason=${r.probe_memory_bomb.reason} ${r.probe_memory_bomb.error || ''}`);
+}
 
 // Host must still be healthy after the probes.
 const after = await run(S.ema_cross_strategy);
@@ -142,4 +153,5 @@ check('throughput 28.8k 1m bars', perf.ok, `ms=${perf.ms} setup=${perf.setupMs} 
 
 const failed = results.filter((x) => !x.pass);
 console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
-process.exit(failed.length ? 1 : 0);
+// Let the event loop drain instead of process.exit(), so isolated-vm tears down normally.
+process.exitCode = failed.length ? 1 : 0;
