@@ -22,10 +22,19 @@ export function stateFrom(result, { strategyKey, symbol }) {
     drawings.push({ kind: 'box', id: `b${b.id}`, t1: sec(Math.min(b.t1, b.t2)), t2: sec(Math.max(b.t1, b.t2)), p1: Math.max(b.top, b.bottom), p2: Math.min(b.top, b.bottom) });
   }
 
+  // Shape ids must be STABLE across runs (the chart diffs by id): key them by
+  // bar time + direction + per-bar ordinal, never by position in the list,
+  // which shifts as the window rolls and would redraw every marker each update.
   const shapes = (result.shapes || []).filter((s) => num(s.t) && num(s.price));
-  shapes.slice(-MAX_SHAPES).forEach((s, i) => {
-    drawings.push({ kind: 'shape', id: `s${sec(s.t)}_${i}`, t: sec(s.t), price: s.price, dir: s.dir === 'down' ? 'down' : 'up', text: s.text || '' });
-  });
+  const perBar = new Map();
+  for (const s of shapes.slice(-MAX_SHAPES)) {
+    const t = sec(s.t);
+    const dir = s.dir === 'down' ? 'down' : 'up';
+    const k = `${t}_${dir}`;
+    const n = perBar.get(k) || 0;
+    perBar.set(k, n + 1);
+    drawings.push({ kind: 'shape', id: `s${k}_${n}`, t, price: s.price, dir, text: s.text || '' });
+  }
 
   for (const l of result.drawings?.lines || []) {
     if (num(l.p1) && l.p1 === l.p2 && levels.length < MAX_LEVELS) {

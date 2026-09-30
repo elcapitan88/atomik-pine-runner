@@ -143,7 +143,21 @@ return (async () => {
     for (const k of ['histogram', 'columns', 'areabr', 'area', 'circles', 'cross', 'stepline', 'linebr']) if (s.includes(k)) return k;
     return 'line';
   };
-  const paletteOf = () => { const list = []; const idx = new Map(); return { list, indexOf: (c) => { if (!c) return null; if (!idx.has(c)) { if (list.length >= 16) return null; idx.set(c, list.length); list.push(c); } return idx.get(c); } }; };
+  // Palettes must be DETERMINISTIC across runs: the chart registers a study
+  // from them and rebuilds when they change, so first-seen order (which
+  // shifts as bars roll) would rebuild the chart on every update. Colours are
+  // sorted and indexes remapped once the run is complete.
+  const paletteOf = () => {
+    const list = []; const idx = new Map();
+    const indexOf = (c) => { if (!c) return null; if (!idx.has(c)) { if (list.length >= 16) return null; idx.set(c, list.length); list.push(c); } return idx.get(c); };
+    const finish = (indexes) => {
+      const sorted = [...list].sort();
+      const remap = new Map(list.map((c, i) => [i, sorted.indexOf(c)]));
+      for (let i = 0; i < indexes.length; i++) if (indexes[i] !== null) indexes[i] = remap.get(indexes[i]);
+      return sorted;
+    };
+    return { list, indexOf, finish };
+  };
   for (const [name, plot] of Object.entries(ctx.plots || {})) {
     if (name.startsWith('__')) continue;
     const o = (plot && plot.options) || {};
@@ -171,7 +185,7 @@ return (async () => {
         if (i === undefined) continue;
         idx[i] = pal.indexOf(cssColor(p.options && p.options.color));
       }
-      if (pal.list.length) series[style === 'barcolor' ? 'barcolor' : 'bgcolor'] = { palette: pal.list, idx };
+      if (pal.list.length) series[style === 'barcolor' ? 'barcolor' : 'bgcolor'] = { palette: pal.finish(idx), idx };
       continue;
     }
     // Regular plot(): values by bar, colours as a palette when they vary.
@@ -191,7 +205,7 @@ return (async () => {
     series.plots.push({
       id: 'p' + series.plots.length, key: name, title: plot.title || name,
       style: styleName(style), color: defaultColor, linewidth: isNum(o.linewidth) ? o.linewidth : 1,
-      overlay: o.overlay === true, values, colors: multi ? { palette: pal.list, idx: colorIdx } : null,
+      overlay: o.overlay === true, values, colors: multi ? { palette: pal.finish(colorIdx), idx: colorIdx } : null,
     });
   }
   // fills reference plot keys; resolve them to plot ids.

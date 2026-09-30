@@ -66,6 +66,19 @@ plot(ta.sma(close, 6), "hidden", display=display.none)`, { maxSeriesBars: 200 })
     expect(r.series.plots[0].values.length).toBe(200);
   });
 
+  it('palettes are deterministic (sorted) so the chart never rebuilds on a rolling window', async () => {
+    const a = await run(SCRIPT, { limit: 600 });
+    const b = await run(SCRIPT, { limit: 590 }); // window shifted: first-seen colour may differ
+    const pa = a.series.plots.find((p) => p.title === 'slow').colors.palette;
+    const pb = b.series.plots.find((p) => p.title === 'slow').colors.palette;
+    expect(pa).toEqual([...pa].sort());
+    expect(pa).toEqual(pb);
+    expect(a.series.barcolor.palette).toEqual([...a.series.barcolor.palette].sort());
+    // index -> colour mapping is consistent with the sorted palette
+    const idx = a.series.plots.find((p) => p.title === 'slow').colors.idx.find((i) => i !== null);
+    expect(pa[idx]).toMatch(/^#/);
+  });
+
   it('state payload carries series and no polylines', async () => {
     const r = await run(SCRIPT);
     const st = stateFrom(r, { strategyKey: 'k', symbol: 'NQ' });
