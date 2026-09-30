@@ -1,0 +1,6 @@
+node_modules/
+.env
+.env.*
+# Private strategy scripts used for local parity checks. Never commit them.
+private-fixtures/
+.local/

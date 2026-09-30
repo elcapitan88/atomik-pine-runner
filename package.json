@@ -1,0 +1,18 @@
+{
+  "name": "atomik-pine-runner",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sandboxed Pine Script runner for Atomik Trading, built on PineTS.",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "spike": "node --no-node-snapshot spike/sandbox-spike.mjs"
+  },
+  "dependencies": {
+    "isolated-vm": "^7.0.1",
+    "pinets": "0.10.0"
+  }
+}
