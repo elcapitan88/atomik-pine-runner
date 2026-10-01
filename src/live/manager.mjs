@@ -13,7 +13,7 @@
 import { BarAggregator, mergeBar } from './bars.mjs';
 import { DataHubFeed } from './datahub.mjs';
 import { StateBus } from './redis.mjs';
-import { stateFrom, stateHash, emptyState, partialStateFrom } from './state.mjs';
+import { stateFrom, stateHash, emptyState, partialStateFrom, MAX_RICH_DRAWINGS } from './state.mjs';
 import { diffLedger, newLedgerState, liveSnapshot, needsIntrabar } from './signals.mjs';
 import { ExecutionClient } from './execution.mjs';
 import { atomikToSeconds, SUPPORTED_TIMEFRAMES } from '../timeframes.mjs';
@@ -345,7 +345,7 @@ export class LiveManager {
           // else changed) so an open chart pops them up; never cached.
           const withAlerts = (p) => (fresh.length ? { ...p, alerts: fresh } : p);
           if (!chartFull) {
-            const partial = partialStateFrom(res.live, { strategyKey: s.strategyKey, symbol: s.symbol });
+            const partial = partialStateFrom(res.live, this.#stateOpts(s));
             if (partial) {
               const hash = stateHash(partial);
               if (hash !== s.lastPartialHash || fresh.length) {
@@ -354,7 +354,7 @@ export class LiveManager {
               }
             }
           } else {
-            const payload = stateFrom(res.live, { strategyKey: s.strategyKey, symbol: s.symbol });
+            const payload = stateFrom(res.live, this.#stateOpts(s));
             const hash = stateHash(payload);
             s.lastPayload = payload;
             s.lastPartialHash = null;
@@ -384,6 +384,11 @@ export class LiveManager {
     } finally {
       s.running = false;
     }
+  }
+
+  /** How a session's results become chart state (PINE_RICH_DRAWINGS). */
+  #stateOpts(s) {
+    return { strategyKey: s.strategyKey, symbol: s.symbol, rich: !!this.config.richDrawings, maxDrawings: this.config.maxDrawings ?? MAX_RICH_DRAWINGS };
   }
 
   /**
