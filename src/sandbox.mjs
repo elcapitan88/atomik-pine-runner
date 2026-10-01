@@ -8,7 +8,9 @@
 import ivm from 'isolated-vm';
 import { readFileSync } from 'node:fs';
 
-const BUNDLE_PATH = new URL('../node_modules/pinets/dist/pinets.min.browser.js', import.meta.url);
+// PineTS 0.10.0 + our transpiler fixes (vendor/pinets/README.md). Back to
+// node_modules/pinets once an upstream release carries them.
+const BUNDLE_PATH = new URL('../vendor/pinets/pinets.min.browser.js', import.meta.url);
 const BUNDLE_SOURCE = readFileSync(BUNDLE_PATH, 'utf8');
 
 // V8 code cache for the PineTS bundle, produced by the first isolate and reused

@@ -8,6 +8,8 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 COPY src ./src
+# Patched PineTS bundle the sandbox loads (vendor/pinets/README.md).
+COPY vendor ./vendor
 
 RUN useradd --create-home appuser
 USER appuser

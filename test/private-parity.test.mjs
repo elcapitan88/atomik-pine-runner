@@ -6,6 +6,9 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { streamThrough, trades, opens, pending, boxes, lines, labels, plotValues, median } from './stream-harness.mjs';
 
 const DIR = new URL('../private-fixtures/', import.meta.url);
+// A countdown label built from `timenow` ("(17:34:09)", "(2D 04:19:09)") reads
+// the wall clock, so two runs a second apart differ: compare it as a countdown.
+const clockless = (ls) => ls.map(([t, price, text]) => [t, price, typeof text === 'string' ? text.replace(/\((\d+D )?\d+(:\d+)*\)/g, '(countdown)') : text]);
 const files = existsSync(DIR) ? readdirSync(DIR).filter((f) => f.endsWith('.pine')) : [];
 
 describe.skipIf(!files.length)('streaming parity on private scripts', () => {
@@ -28,7 +31,7 @@ describe.skipIf(!files.length)('streaming parity on private scripts', () => {
         expect(r.streamed.shapes).toEqual(r.oneShot.shapes);
         expect(boxes(r.streamed)).toEqual(boxes(r.oneShot));
         expect(lines(r.streamed)).toEqual(lines(r.oneShot));
-        expect(labels(r.streamed)).toEqual(labels(r.oneShot));
+        expect(clockless(labels(r.streamed))).toEqual(clockless(labels(r.oneShot)));
         console.log(`${f}: open ${r.first.ms}ms, one-shot ${r.oneShot.ms}ms, update median ${median(r.times)}ms max ${Math.max(...r.times)}ms, trades ${trades(r.oneShot).length}`);
       } finally {
         r.stream?.dispose();
