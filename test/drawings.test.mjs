@@ -5,6 +5,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { runPine } from '../src/sandbox.mjs';
 import { stateFrom, partialStateFrom, stateHash, pineColor, richDrawings } from '../src/live/state.mjs';
 import { config } from '../src/config.mjs';
+import { LiveManager } from '../src/live/manager.mjs';
 import { fetchBars, symbolInfo } from './synthetic.mjs';
 import { streamThrough } from './stream-harness.mjs';
 
@@ -135,5 +136,55 @@ if bar_index % 50 == 0
     const box = a.find((d) => d.kind === 'box');
     expect(box.id).toBe(`bx${Math.floor(r.oneShot.firstTime / 1000)}_0`); // created on the first bar
     expect(new Set(a.map((d) => d.id)).size).toBe(a.length);
+  });
+});
+
+describe('rich drawings: the live manager', () => {
+  const T0 = Date.UTC(2026, 8, 29, 14, 30);
+  const bar = (i) => ({ openTime: T0 + i * 300_000, open: 1, high: 2, low: 0, close: 1, volume: 1, closeTime: T0 + i * 300_000 + 299_999 });
+  const cfg = { redisUrl: '', datahubWsUrl: '', datahubApiKey: '', backendInternalUrl: 'http://backend', serviceKey: 'k', liveWarmupBars: 100, liveSyncSeconds: 30, liveRunTimeoutMs: 1000, liveIntrabarSeconds: 60, liveHeartbeatSeconds: 60 };
+  const live = (lastTime) => ({
+    kind: 'indicator', title: 't', bars: 3, lastTime, plots: {}, shapes: [], series: null,
+    drawings: {
+      boxes: [{ id: 7, at: T0, t1: T0, t2: T0 + 600_000, top: 2, bottom: 1, bgcolor: '#4CAF5033', border_color: '#363A45', border_width: 1, border_style: 'style_solid', extend: 'none' }],
+      lines: [{ id: 8, at: T0, t1: T0, t2: T0, p1: 2, p2: 0, color: '#363A45', style: 'style_solid', extend: 'none', width: 1 }],
+      labels: [{ id: 9, at: T0, t: T0, price: 2, text: '1D', style: 'style_label_down', color: '#ffffff00', textcolor: '#363A45', size: 'large', textalign: 'center', yloc: 'price' }],
+    },
+  });
+
+  async function publishedWith(extra) {
+    const published = [];
+    const m = new LiveManager({
+      config: { ...cfg, ...extra },
+      pool: { run: async (job) => ({ ok: true, live: live(job.bars.at(-1).openTime) }) },
+      log: { info() {}, warn() {}, error() {} },
+      fetchImpl: async () => ({ ok: true, json: async () => [{ strategy_code_id: 1, strategy_key: 'k', symbol: 'NQ', timeframe: '5m', source: '//@version=6\nindicator("x")' }] }),
+    });
+    m.bus = { publishState: async (p) => { published.push(p); return true; }, stats: {} };
+    m.feed = { setSymbols() {}, stats: {} };
+    await m.sync();
+    const s = m.sessions.get('1:NQ');
+    s.bars = [0, 1, 2].map(bar);
+    s.warmed = true;
+    await m.onBarForTest('NQ', 300, bar(2));
+    return published.at(-1);
+  }
+
+  it('PINE_RICH_DRAWINGS on: styled kinds, no levels', async () => {
+    const p = await publishedWith({ richDrawings: true });
+    expect(p.drawings.map((d) => [d.kind, d.id])).toEqual([['box', `bx${T0 / 1000}_0`], ['line', `ln${T0 / 1000}_0`], ['label', `lb${T0 / 1000}_0`]]);
+    expect(p.drawings[0]).toMatchObject({ bg: '#4caf5033', border: '#363a45ff' });
+    expect(p.levels).toEqual([]);
+  });
+
+  it('flag off (default): plain boxes and price levels', async () => {
+    const p = await publishedWith({});
+    expect(p.drawings).toEqual([{ kind: 'box', id: 'b7', t1: T0 / 1000, t2: T0 / 1000 + 600, p1: 2, p2: 1 }]);
+    expect(p.levels.map((l) => [l.price, l.label])).toEqual([[2, '1D']]);
+  });
+
+  it('PINE_MAX_DRAWINGS caps each kind', async () => {
+    const p = await publishedWith({ richDrawings: true, maxDrawings: 0 });
+    expect(p.drawings).toEqual([]);
   });
 });
