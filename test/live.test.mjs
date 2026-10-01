@@ -115,3 +115,44 @@ describe('LiveManager sync', () => {
     expect(published[0].drawings).toEqual([]);
   });
 });
+
+describe('Strategy Tester', () => {
+  const T = Date.UTC(2026, 8, 30, 14, 0);
+  const strat = {
+    closedtrades: [
+      { entry_id: 'L', entry_time: T, entry_price: 100, exit_id: 'LX', exit_time: T + 600_000, exit_price: 104, size: 1, profit: 80 },
+      { entry_id: 'S', entry_time: T + 900_000, entry_price: 105, exit_id: null, exit_time: T + 1_200_000, exit_price: 107, size: -1, profit: -40 },
+    ],
+    closedtrades_total: 2,
+    opentrades: [{ entry_id: 'L', entry_time: T + 1_500_000, entry_price: 103, size: 1 }],
+    netprofit: 40, grossprofit: 80, grossloss: -40, wintrades: 1, losstrades: 1, max_drawdown: 40, initial_capital: 1000000, position_size: 1,
+  };
+  const result = { title: 'EMA cross', firstTime: T - 86_400_000, plots: {}, shapes: [], drawings: { boxes: [], lines: [], labels: [] }, series: null, strategy: strat };
+
+  it('summarises the ledger: P&L, profit factor, win rate, trades, open trades', () => {
+    const p = stateFrom(result, { strategyKey: 'k', symbol: 'NQ' });
+    expect(p.tester).toMatchObject({ title: 'EMA cross', closed_total: 2, netprofit: 40, grossloss: 40, profit_factor: 2, win_rate: 0.5, position_size: 1, since: Math.floor((T - 86_400_000) / 1000) });
+    expect(p.tester.trades).toHaveLength(2);
+    expect(p.tester.trades[1]).toMatchObject({ entry_id: 'S', size: -1, profit: -40, exit_time: Math.floor((T + 1_200_000) / 1000) });
+    expect(p.tester.open).toEqual([{ entry_id: 'L', entry_time: Math.floor((T + 1_500_000) / 1000), entry_price: 103, size: 1 }]);
+  });
+
+  it('marks entries and exits on the chart with stable ids', () => {
+    const shapes = stateFrom(result, { strategyKey: 'k', symbol: 'NQ' }).drawings.filter((d) => d.kind === 'shape');
+    expect(shapes.map((d) => [d.dir, d.text])).toEqual([
+      ['up', 'L'], ['down', 'LX +$80.00'],      // long: enter up, exit down
+      ['down', 'S'], ['up', 'Close -$40.00'],   // short: enter down, exit up
+      ['up', 'L'],                              // open trade: entry only
+    ]);
+    const again = stateFrom(result, { strategyKey: 'k', symbol: 'NQ' }).drawings.map((d) => d.id);
+    expect(again).toEqual(shapes.map((d) => d.id));
+  });
+
+  it('indicators have no tester; intrabar frames never carry it', () => {
+    expect(stateFrom({ ...result, strategy: null }, { strategyKey: 'k', symbol: 'NQ' }).tester).toBeUndefined();
+    const withSeries = { ...result, series: { times: [1, 2], plots: [{ id: 'p0', values: [1, 2], colors: null }], hlines: [], fills: [], barcolor: null, bgcolor: null } };
+    const partial = partialStateFrom(withSeries, { strategyKey: 'k', symbol: 'NQ' });
+    expect(partial.partial).toBe(true);
+    expect(partial).not.toHaveProperty('tester');
+  });
+});

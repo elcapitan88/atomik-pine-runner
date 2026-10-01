@@ -165,7 +165,7 @@ function chartProvider(symbol, timeframe, getBars) {
   };
 }
 
-const liveFields = (res) => ({ kind: res.kind, title: res.title, bars: res.bars, lastTime: res.lastTime, plots: res.plots, shapes: res.shapes, drawings: res.drawings, series: res.series, strategy: res.strategy, ms: res.ms });
+const liveFields = (res) => ({ kind: res.kind, title: res.title, bars: res.bars, firstTime: res.firstTime, lastTime: res.lastTime, plots: res.plots, shapes: res.shapes, drawings: res.drawings, series: res.series, strategy: res.strategy, ms: res.ms });
 
 async function liveRun(job) {
   const pineTf = atomikToPine(job.timeframe);
