@@ -162,6 +162,54 @@ globalThis.__deepRestore = (snap) => {
     }
   }
 };
+// Script inputs (TradingView's settings dialog). The script runs as a PineTS
+// Indicator carrying the user's overrides, keyed by input id (\`in_N\`).
+// PineTS runs request.security's higher-timeframe copy from the bare source
+// (or a pre-transpiled slice) with NO overrides, so a security expression that
+// uses an input would silently keep its default: secondaries get the same
+// overrides here. One script per isolate, so a global is enough.
+globalThis.__pineInputs = null;
+globalThis.__indicatorFor = (source, inputs) => {
+  const has = inputs && typeof inputs === 'object' && Object.keys(inputs).length > 0;
+  globalThis.__pineInputs = has ? inputs : null;
+  if (has) {
+    const proto = PineTS.prototype;
+    if (!proto.__inputsPatched) {
+      proto.__inputsPatched = true;
+      const run = proto.run;
+      const runPre = proto.runPretranspiled;
+      proto.run = function (code, ...rest) {
+        if (this._isSecondaryContext && globalThis.__pineInputs && typeof code === 'string') {
+          code = new PineTSLib.Indicator(code, globalThis.__pineInputs);
+        }
+        return run.call(this, code, ...rest);
+      };
+      proto.runPretranspiled = function (fn, inputs, ...rest) {
+        if (this._isSecondaryContext && globalThis.__pineInputs) inputs = { ...globalThis.__pineInputs, ...(inputs || {}) };
+        return runPre.call(this, fn, inputs, ...rest);
+      };
+    }
+  }
+  return new PineTSLib.Indicator(source, has ? inputs : {});
+};
+
+// The script's declared inputs (id, type, default, title, options, range...),
+// plain JSON for the settings dialog.
+const __INPUT_FIELDS = ['id', 'name', 'type', 'defval', 'title', 'tooltip', 'group', 'inline', 'options', 'minval', 'maxval', 'step', 'display', 'confirm'];
+globalThis.__inputsMeta = (ind) => {
+  let meta = [];
+  try { meta = ind.getInputsMeta() || []; } catch (e) { return []; }
+  return meta.slice(0, 100).map((m) => {
+    const o = {};
+    for (const k of __INPUT_FIELDS) {
+      const v = m[k];
+      if (v === undefined || typeof v === 'function') continue;
+      try { o[k] = JSON.parse(JSON.stringify(v)); } catch (e) { /* not JSON: skip */ }
+    }
+    return o;
+  });
+};
+
 globalThis.__installDeepRollback = (PineTSClass) => {
   const proto = PineTSClass.prototype;
   if (proto.__deepRollback) return;
@@ -404,14 +452,18 @@ const state = { dataError: null };
 return (async () => {
   const pine = new PineTS(__makeProvider(state, opts), opts.tickerId, opts.timeframe, opts.limit ?? undefined, opts.sDate ?? undefined, opts.eDate ?? undefined);
   let ctx;
+  let ind;
   try {
-    ctx = await pine.run(source);
+    ind = __indicatorFor(source, opts.inputs);
+    ctx = await pine.run(ind);
   } catch (err) {
     if (state.dataError) throw new Error(state.dataError);
     throw err;
   }
   if (state.dataError) throw new Error(state.dataError);
-  return JSON.stringify(__extract(ctx, source, opts));
+  const out = __extract(ctx, source, opts);
+  out.inputs = __inputsMeta(ind);
+  return JSON.stringify(out);
 })();
 `;
 
@@ -429,7 +481,8 @@ return (async () => {
   try {
     __installDeepRollback(PineTS);
     S.pine = new PineTS(__makeProvider(S.state, opts), opts.tickerId, opts.timeframe, opts.limit ?? undefined);
-    S.it = S.pine.run(source, undefined, 1e9);
+    S.ind = __indicatorFor(source, opts.inputs);
+    S.it = S.pine.run(S.ind, undefined, 1e9);
     r = await S.it.next();
   } catch (err) {
     if (S.state.dataError) throw new Error(S.state.dataError);
@@ -444,6 +497,7 @@ return (async () => {
   const bs = S.ctx.pine && S.ctx.pine.barstate;
   if (bs) bs.setLive = () => { bs._live = !S.newBar; };
   const out = __extract(S.ctx, source, opts);
+  out.inputs = __inputsMeta(S.ind);
   __drain(S.ctx);
   return JSON.stringify(out);
 })();
@@ -533,7 +587,7 @@ function failure(out, isolate, bridge, logs, started) {
  * @param {number} [args.memoryMb]     isolate heap limit
  * @param {number} [args.maxPlotPoints]
  */
-export async function runPine({ source, tickerId, timeframe, limit = null, sDate = null, eDate = null, symbolInfo, fetchBars, timeoutMs = 10_000, memoryMb = 128, maxPlotPoints = 3000, maxSeriesBars = 3000 }) {
+export async function runPine({ source, tickerId, timeframe, limit = null, sDate = null, eDate = null, symbolInfo, fetchBars, timeoutMs = 10_000, memoryMb = 128, maxPlotPoints = 3000, maxSeriesBars = 3000, inputs = null }) {
   const started = performance.now();
   const logs = [];
   const bridge = { fetchBars, error: null };
@@ -543,7 +597,7 @@ export async function runPine({ source, tickerId, timeframe, limit = null, sDate
     const out = await withDeadline(isolate, timeoutMs, async () => {
       const context = await prepareContext(isolate, logs, bridge);
       setupMs = performance.now() - started;
-      return context.evalClosure(RUN_CLOSURE, [source, JSON.stringify({ tickerId, timeframe, limit, sDate, eDate, symbolInfo, maxPlotPoints, maxSeriesBars })], {
+      return context.evalClosure(RUN_CLOSURE, [source, JSON.stringify({ tickerId, timeframe, limit, sDate, eDate, symbolInfo, maxPlotPoints, maxSeriesBars, inputs })], {
         arguments: { copy: true },
         result: { promise: true, copy: true },
       });
@@ -575,14 +629,14 @@ export class PineStream {
   }
 
   /** Same arguments and result fields as runPine, plus `stream` on success. */
-  static async open({ source, tickerId, timeframe, limit = null, symbolInfo, fetchBars, timeoutMs = 20_000, memoryMb = 256, maxPlotPoints = 400, maxSeriesBars = 3000, maxClosedTrades = 0 }) {
+  static async open({ source, tickerId, timeframe, limit = null, symbolInfo, fetchBars, timeoutMs = 20_000, memoryMb = 256, maxPlotPoints = 400, maxSeriesBars = 3000, maxClosedTrades = 0, inputs = null }) {
     const started = performance.now();
     const logs = [];
     const bridge = { fetchBars, error: null };
     const isolate = new ivm.Isolate({ memoryLimit: memoryMb });
     const out = await withDeadline(isolate, timeoutMs, async () => {
       const context = await prepareContext(isolate, logs, bridge);
-      const json = await context.evalClosure(STREAM_OPEN, [source, JSON.stringify({ tickerId, timeframe, limit, symbolInfo, maxPlotPoints, maxSeriesBars, maxClosedTrades })], {
+      const json = await context.evalClosure(STREAM_OPEN, [source, JSON.stringify({ tickerId, timeframe, limit, symbolInfo, maxPlotPoints, maxSeriesBars, maxClosedTrades, inputs })], {
         arguments: { copy: true },
         result: { promise: true, copy: true },
       });

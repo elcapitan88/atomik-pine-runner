@@ -62,6 +62,19 @@ describe('POST /v1/compile', () => {
     expect(j).toMatchObject({ ok: true, kind: 'strategy', is_automatable: true });
     expect(j.trades_in_sample).toBeGreaterThan(0);
   });
+  it('reports declared inputs and runs with overrides', async () => {
+    const src = `//@version=6
+indicator("In")
+len = input.int(14, "Length", minval=2)
+plot(ta.sma(close, len), "ma")`;
+    const j = await (await post('/v1/compile', { source: src, inputs: { in_0: 30 } })).json();
+    expect(j.ok).toBe(true);
+    expect(j.inputs).toEqual([expect.objectContaining({ id: 'in_0', type: 'int', defval: 14, title: 'Length', minval: 2 })]);
+    const bad = await post('/v1/compile', { source: src, inputs: { in_0: { nested: true } } });
+    expect(bad.status).toBe(400);
+    const arr = await post('/v1/compile', { source: src, inputs: [1] });
+    expect(arr.status).toBe(400);
+  });
   it('returns the plot structure for native-study registration', async () => {
     const src = `//@version=6
 indicator("Spec", overlay=false)

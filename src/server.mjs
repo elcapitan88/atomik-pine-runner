@@ -39,6 +39,23 @@ app.get('/health', async () => ({
   live: live ? live.stats : null,
 }));
 
+// Script input overrides ({in_N: value}) from the settings dialog: a small map
+// of primitives. The backend validates them against the script's declared
+// inputs; this only guards the shape. Returns [inputs|null, error|null].
+function checkInputs(inputs) {
+  if (inputs == null) return [null, null];
+  if (typeof inputs !== 'object' || Array.isArray(inputs)) return [null, 'inputs must be an object of input id -> value'];
+  const entries = Object.entries(inputs);
+  if (entries.length > 100) return [null, 'too many inputs'];
+  for (const [k, v] of entries) {
+    if (typeof k !== 'string' || k.length > 64) return [null, `bad input id '${String(k).slice(0, 64)}'`];
+    const t = typeof v;
+    if (!(t === 'string' || t === 'boolean' || (t === 'number' && Number.isFinite(v)))) return [null, `input '${k}' must be a string, number or boolean`];
+    if (t === 'string' && v.length > 2000) return [null, `input '${k}' is too long`];
+  }
+  return [entries.length ? inputs : null, null];
+}
+
 function checkSource(source) {
   if (typeof source !== 'string' || !source.trim()) return 'source is required';
   if (Buffer.byteLength(source) > config.maxSourceBytes) return `source exceeds ${config.maxSourceBytes} bytes`;
@@ -57,7 +74,9 @@ app.register(async (v1) => {
     const symbol = body.symbol ? tickerToRoot(body.symbol) : null;
     if (body.symbol && !symbol) return reply.code(400).send({ detail: `Unknown symbol '${body.symbol}'` });
     if (body.timeframe && !SUPPORTED_TIMEFRAMES.includes(body.timeframe)) return reply.code(400).send({ detail: `Unsupported timeframe '${body.timeframe}'` });
-    const res = await pool.run({ type: 'compile', source: body.source, symbol, timeframe: body.timeframe || null, symbol_info: body.symbol_info || null }, { timeoutMs: config.compileTimeoutMs });
+    const [inputs, badInputs] = checkInputs(body.inputs);
+    if (badInputs) return reply.code(400).send({ detail: badInputs });
+    const res = await pool.run({ type: 'compile', source: body.source, symbol, timeframe: body.timeframe || null, symbol_info: body.symbol_info || null, inputs }, { timeoutMs: config.compileTimeoutMs });
     if (!res.ok) return reply.code(res.status || 500).send({ detail: res.detail });
     return res.compile;
   });
@@ -72,7 +91,9 @@ app.register(async (v1) => {
     const start = Date.parse(body.start);
     const end = Date.parse(body.end);
     if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return reply.code(400).send({ detail: 'start and end must be ISO timestamps with end after start' });
-    const res = await pool.run({ type: 'backtest', source: body.source, symbol, timeframe: body.timeframe, start_ms: start, end_ms: end, symbol_info: body.symbol_info || null }, { timeoutMs: config.backtestTimeoutMs });
+    const [inputs, badInputs] = checkInputs(body.inputs);
+    if (badInputs) return reply.code(400).send({ detail: badInputs });
+    const res = await pool.run({ type: 'backtest', source: body.source, symbol, timeframe: body.timeframe, start_ms: start, end_ms: end, symbol_info: body.symbol_info || null, inputs }, { timeoutMs: config.backtestTimeoutMs });
     if (!res.ok) return reply.code(res.status || 500).send({ detail: res.detail, line: res.line ?? null });
     if (res.backtest.bars_processed === 0) return reply.code(400).send({ detail: `No historical data for ${symbol} ${body.timeframe} between ${body.start} and ${body.end}.` });
     return res.backtest;

@@ -132,7 +132,9 @@ export class LiveManager {
         const cur = this.sessions.get(key);
         const activations = Array.isArray(it.activations) ? it.activations : [];
         const trading = it.kind === 'trade' && activations.length > 0 && !!it.strategy_name;
-        if (cur && cur.source === it.source && cur.timeframe === it.timeframe && cur.strategyKey === it.strategy_key) {
+        const inputs = it.inputs && typeof it.inputs === 'object' ? it.inputs : null;
+        const inputsKey = JSON.stringify(inputs || {});
+        if (cur && cur.source === it.source && cur.timeframe === it.timeframe && cur.strategyKey === it.strategy_key && cur.inputsKey === inputsKey) {
           // Same script: refresh who trades it without resetting the session
           // (a rebuild would forget the positions it opened).
           if (trading && !cur.trading) this.log.info?.(`live: ${key} now trading as "${it.strategy_name}" (${activations.length} account(s))`);
@@ -142,6 +144,8 @@ export class LiveManager {
         }
         const s = {
           key, id: it.strategy_code_id, strategyKey: it.strategy_key, symbol: it.symbol, timeframe: it.timeframe, seconds: atomikToSeconds(it.timeframe), source: it.source, symbolInfo: it.symbol_info || null,
+          // Settings-dialog overrides ({in_N: value}); a change rebuilds the session.
+          inputs, inputsKey,
           bars: [], warmed: false, runs: 0, intrabarRuns: 0, lastRunMs: null, lastError: null, lastHash: null, lastPayload: null, lastPartialHash: null, running: false, pending: false, wantBoundary: false, closedPending: false, closedAt: 0, dirty: false, lastIntrabarAt: 0, triggerAt: 0, intrabarMs: (this.config.liveIntrabarSeconds || 5) * 1000, intrabarNeeded: false,
           streamed: false, streamLast: null, streamBars: 0, streamOpens: 0, streamFailures: 0, streamOff: false, streamRetryAt: 0, heapMb: null,
           trading, activations, strategyName: it.strategy_name || null, ledger: newLedgerState(), outbox: Promise.resolve(), shadowSignals: 0, signalsSent: 0, signalsFailed: 0, signalLog: [], lastLatencyMs: null,
@@ -394,7 +398,7 @@ export class LiveManager {
     }
     const bars = forming ? [...s.bars, forming] : s.bars;
     const res = await this.pool.run(
-      { type: 'live_run', source: s.source, symbol: s.symbol, timeframe: s.timeframe, bars, symbol_info: s.symbolInfo, max_series_bars: maxSeries },
+      { type: 'live_run', source: s.source, symbol: s.symbol, timeframe: s.timeframe, bars, symbol_info: s.symbolInfo, max_series_bars: maxSeries, inputs: s.inputs },
       { timeoutMs: this.config.liveRunTimeoutMs, priority: !!s.trading },
     );
     if (streamFailed) {
@@ -438,7 +442,7 @@ export class LiveManager {
       s.streamed = false;
     }
     const bars = forming ? [...s.bars, forming] : s.bars;
-    const res = await this.streams.open(s.key, { source: s.source, symbol: s.symbol, timeframe: s.timeframe, bars, symbol_info: s.symbolInfo, max_series_bars: maxSeries, timeout_ms: timeoutMs }, { timeoutMs });
+    const res = await this.streams.open(s.key, { source: s.source, symbol: s.symbol, timeframe: s.timeframe, bars, symbol_info: s.symbolInfo, max_series_bars: maxSeries, timeout_ms: timeoutMs, inputs: s.inputs }, { timeoutMs });
     if (res.ok) {
       s.streamed = true;
       s.streamOpens++;

@@ -39,11 +39,11 @@ export const baseOpts = { tickerId: 'NQ', symbolInfo, timeoutMs: 60_000, memoryM
 /**
  * @returns {{first, streamed, oneShot, times: number[], stream: PineStream|null, error?: string}}
  */
-export async function streamThrough(source, { history = 1200, liveBars = 30, timeframe = '5', maxSeriesBars } = {}) {
+export async function streamThrough(source, { history = 1200, liveBars = 30, timeframe = '5', maxSeriesBars, inputs = null } = {}) {
   const all = barsFor(timeframe).slice(0, history + liveBars);
   const series = maxSeriesBars ?? history + liveBars;
   const live = all.slice(0, history).map((b) => ({ ...b }));
-  const opts = { ...baseOpts, timeframe };
+  const opts = { ...baseOpts, timeframe, inputs };
   const first = await PineStream.open({ ...opts, source, limit: live.length, fetchBars: providerFor(live, timeframe), maxSeriesBars: series });
   if (!first.ok) return { first, error: `open: ${first.error}` };
   const times = [];

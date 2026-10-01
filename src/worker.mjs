@@ -64,6 +64,7 @@ async function compile(job) {
     timeoutMs: config.compileTimeoutMs,
     memoryMb: config.isolateMemoryMb,
     maxPlotPoints: 50,
+    inputs: job.inputs || null,
   });
   if (!res.ok) {
     if (res.reason === 'data') return { ok: false, status: 503, detail: res.error };
@@ -87,6 +88,8 @@ async function compile(job) {
       // Plot structure (no values): the chart registers the script as a native
       // study from this before it ever runs live.
       series_spec: seriesSpec(res.series),
+      // Declared inputs (TradingView's settings dialog): id, type, default, range, options.
+      inputs: res.inputs || [],
       trades_in_sample: res.strategy ? res.strategy.closedtrades.length : null,
       ms: res.ms,
     },
@@ -107,6 +110,7 @@ async function backtest(job) {
     timeoutMs: config.backtestTimeoutMs,
     memoryMb: config.isolateMemoryMb,
     maxPlotPoints: config.maxPlotPoints,
+    inputs: job.inputs || null,
   });
   if (!res.ok) {
     if (res.reason === 'data') return { ok: false, status: res.dataError instanceof ScriptError ? 400 : 503, detail: res.error };
@@ -177,6 +181,7 @@ async function liveRun(job) {
     timeoutMs: config.liveRunTimeoutMs,
     memoryMb: config.isolateMemoryMb,
     maxPlotPoints: 400,
+    inputs: job.inputs || null,
     // An intrabar run only ships the last bar's values, so it asks for a
     // couple of series bars instead of the whole history.
     maxSeriesBars: Number.isFinite(job.max_series_bars) && job.max_series_bars > 0 ? job.max_series_bars : config.liveWarmupBars,
@@ -219,6 +224,7 @@ async function streamOpen(job) {
     memoryMb: config.isolateMemoryMb,
     maxPlotPoints: 400,
     maxSeriesBars: Number.isFinite(job.max_series_bars) && job.max_series_bars > 0 ? job.max_series_bars : config.liveWarmupBars,
+    inputs: job.inputs || null,
   });
   if (!res.ok) return { ok: false, status: 400, detail: liveError(res) };
   entry.stream = res.stream;
