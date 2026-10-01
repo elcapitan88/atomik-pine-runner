@@ -1,0 +1,124 @@
+diff --git a/src/namespaces/Str.ts b/src/namespaces/Str.ts
+index 4d37162..f878e24 100644
+--- a/src/namespaces/Str.ts
++++ b/src/namespaces/Str.ts
+@@ -55,15 +55,24 @@ export class Str {
+         // Pattern-based format: "#", "#.#", "#.##", "0.000", etc.
+         // Count decimal places from the pattern
+         const dotIdx = formatStr.indexOf('.');
++        // Each `0` left of the decimal point is a required integer digit:
++        // str.tostring(9, "00") → "09" (a countdown's "05:09"), as on TradingView.
++        const minIntDigits = ((dotIdx >= 0 ? formatStr.substring(0, dotIdx) : formatStr).match(/0/g) || []).length;
++        const padInt = (s: string): string => {
++            if (minIntDigits <= 1) return s;
++            const neg = s.startsWith('-');
++            const [intDigits, frac] = (neg ? s.slice(1) : s).split('.');
++            return (neg ? '-' : '') + intDigits.padStart(minIntDigits, '0') + (frac !== undefined ? '.' + frac : '');
++        };
+         if (dotIdx >= 0) {
+             const decimalPart = formatStr.substring(dotIdx + 1);
+             const decimals = decimalPart.length;
+-            return value.toFixed(decimals);
++            return padInt(value.toFixed(decimals));
+         }
+ 
+         // No decimal point in format → integer
+         if (formatStr.includes('#') || formatStr.includes('0')) {
+-            return String(Math.round(value));
++            return padInt(String(Math.round(value)));
+         }
+ 
+         return String(value);
+diff --git a/src/namespaces/Time.ts b/src/namespaces/Time.ts
+index 07e5f6f..3e536b1 100644
+--- a/src/namespaces/Time.ts
++++ b/src/namespaces/Time.ts
+@@ -263,6 +263,13 @@ export class TimeHelper {
+             htfBarTime = alignToTimeframe(currentTime, normalizedTF);
+         }
+ 
++        // A timezone passed in the session slot (`time("60", "America/New_York")`
++        // — common in published scripts, accepted by TradingView) is not a
++        // session filter: ignore it rather than halt.
++        if (typeof parsed.session === 'string' && /^[A-Za-z_]+\/[A-Za-z_\/+-]+$/.test(parsed.session) && !parseSessionSpec(parsed.session)) {
++            return htfBarTime;
++        }
++
+         // Session filtering
+         if (parsed.session !== undefined && parsed.session !== '') {
+             const timezone = parsed.timezone || this.context.pine?.syminfo?.timezone || 'UTC';
+diff --git a/src/transpiler/transformers/MainTransformer.ts b/src/transpiler/transformers/MainTransformer.ts
+index 1cb6768..223eeb2 100644
+--- a/src/transpiler/transformers/MainTransformer.ts
++++ b/src/transpiler/transformers/MainTransformer.ts
+@@ -553,6 +553,14 @@ export function runTransformationPass(
+                 };
+                 node.arguments.forEach((arg: any) => traverseForIIFEs(arg));
+             }
++            // A field target (`candle.dow := switch …`) stays an
++            // AssignmentExpression: its switch-expression IIFE on the right
++            // needs the same traversal, or every identifier inside it leaks
++            // bare (→ "ReferenceError: candle is not defined").
++            else if (node.type === 'AssignmentExpression' && node.left?.type === 'MemberExpression' && node.right?.type === 'CallExpression' && node.right.callee &&
++                (node.right.callee.type === 'ArrowFunctionExpression' || node.right.callee.type === 'FunctionExpression')) {
++                c(node.right.callee, state);
++            }
+         },
+         FunctionDeclaration(node: any, state: ScopeManager, c: any) {
+             transformFunctionDeclaration(node, state, c);
+diff --git a/src/transpiler/transformers/StatementTransformer.ts b/src/transpiler/transformers/StatementTransformer.ts
+index cfc1576..3774a1a 100644
+--- a/src/transpiler/transformers/StatementTransformer.ts
++++ b/src/transpiler/transformers/StatementTransformer.ts
+@@ -1044,6 +1044,17 @@ export function transformWhileStatement(node: any, scopeManager: ScopeManager, c
+     }
+ }
+ 
++/**
++ * True for a member chain already rewritten to a context reference
++ * (`$.var.glb1_x`, `$$.let.fn1_y`): its base is the context object itself and
++ * must never be scoped again (that would emit `$.get($$, 0).let…`).
++ */
++function isScopedContextRef(node: any): boolean {
++    let base = node;
++    while (base && base.type === 'MemberExpression') base = base.object;
++    return !!base && base.type === 'Identifier' && (base.name === CONTEXT_NAME || base.name === '$$');
++}
++
+ export function transformExpression(node: any, scopeManager: ScopeManager): void {
+     walk.recursive(node, scopeManager, {
+         MemberExpression(node: any, state: ScopeManager, c: any) {
+@@ -1057,6 +1068,14 @@ export function transformExpression(node: any, scopeManager: ScopeManager): void
+                 node.object.parent = node;
+                 c(node.object, state);
+             }
++            // A dot chain (`htf1.settings.show`) has a MemberExpression object:
++            // walk it too, so the base identifier at the bottom of the chain is
++            // scoped. Otherwise a user variable in an if-condition inside a
++            // function leaks bare → "ReferenceError: htf1 is not defined".
++            else if (node.object && node.object.type === 'MemberExpression' && !node.computed && !isScopedContextRef(node.object)) {
++                node.object.parent = node;
++                c(node.object, state);
++            }
+             transformMemberExpression(node, '', scopeManager);
+         },
+ 
+@@ -1393,8 +1412,17 @@ export function transformReturnStatement(node: any, scopeManager: ScopeManager):
+                             node._arrayAccessed = true;
+                         }
+                     },
+-                    MemberExpression(node: any) {
++                    MemberExpression(node: any, state: ScopeManager, c: any) {
+                         transformMemberExpression(node, '', scopeManager);
++                        // Recurse into non-namespace objects so a user variable at
++                        // the base of a member chain (e.g. a global UDT instance in
++                        // `return t.x + 1`) is scoped like everywhere else —
++                        // otherwise it leaks bare → "ReferenceError: t is not defined".
++                        if (node.type === 'MemberExpression' && node.object && !isScopedContextRef(node.object)) {
++                            if (node.object.type !== 'Identifier' || !scopeManager.isContextBound(node.object.name)) {
++                                c(node.object, state);
++                            }
++                        }
+                     },
+                     // When an arrow function's last statement is an assignment
+                     // (e.g. `tracker.field := …`), the parser folds it into the
