@@ -165,7 +165,7 @@ function chartProvider(symbol, timeframe, getBars) {
   };
 }
 
-const liveFields = (res) => ({ kind: res.kind, title: res.title, bars: res.bars, firstTime: res.firstTime, lastTime: res.lastTime, plots: res.plots, shapes: res.shapes, drawings: res.drawings, series: res.series, strategy: res.strategy, ms: res.ms });
+const liveFields = (res) => ({ kind: res.kind, title: res.title, bars: res.bars, firstTime: res.firstTime, lastTime: res.lastTime, plots: res.plots, shapes: res.shapes, drawings: res.drawings, series: res.series, strategy: res.strategy, alerts: res.alerts || [], ms: res.ms });
 
 async function liveRun(job) {
   const pineTf = atomikToPine(job.timeframe);
@@ -182,6 +182,7 @@ async function liveRun(job) {
     memoryMb: config.isolateMemoryMb,
     maxPlotPoints: 400,
     inputs: job.inputs || null,
+    liveAlerts: true,
     // An intrabar run only ships the last bar's values, so it asks for a
     // couple of series bars instead of the whole history.
     maxSeriesBars: Number.isFinite(job.max_series_bars) && job.max_series_bars > 0 ? job.max_series_bars : config.liveWarmupBars,
@@ -225,6 +226,7 @@ async function streamOpen(job) {
     maxPlotPoints: 400,
     maxSeriesBars: Number.isFinite(job.max_series_bars) && job.max_series_bars > 0 ? job.max_series_bars : config.liveWarmupBars,
     inputs: job.inputs || null,
+    liveAlerts: true,
   });
   if (!res.ok) return { ok: false, status: 400, detail: liveError(res) };
   entry.stream = res.stream;

@@ -437,7 +437,14 @@ globalThis.__extract = (ctx, source, opts) => {
       lastTime: n ? md[n - 1].openTime : null,
       plots, shapes, drawings, series,
       strategy: strat,
-      alerts: (ctx.alerts || []).slice(0, 200),
+      // Newest last; a live run only cares about its latest bars.
+      alerts: (ctx.alerts || []).slice(-200).map((a) => ({
+        type: a.type === 'alertcondition' ? 'alertcondition' : 'alert',
+        id: a.id ?? null,
+        title: a.title == null ? null : String(a.title).slice(0, 200),
+        message: a.message == null ? null : String(a.message).slice(0, 1000),
+        time: typeof a.time === 'number' ? a.time : null,
+      })),
       warnings: (ctx.warnings || []).slice(0, 50).map(String),
       probe: globalThis.__probe ?? null,
     };
@@ -451,6 +458,10 @@ const opts = JSON.parse($1);
 const state = { dataError: null };
 return (async () => {
   const pine = new PineTS(__makeProvider(state, opts), opts.tickerId, opts.timeframe, opts.limit ?? undefined, opts.sDate ?? undefined, opts.eDate ?? undefined);
+  // Live runs: alerts on every bar (the session keeps only new, live ones).
+  // PineTS's default 'realtime' mode only fires on the LAST bar, which misses
+  // alert.freq_once_per_bar_close when the close is seen with the next bar.
+  if (opts.liveAlerts) pine.setAlertMode('all');
   let ctx;
   let ind;
   try {
@@ -481,6 +492,7 @@ return (async () => {
   try {
     __installDeepRollback(PineTS);
     S.pine = new PineTS(__makeProvider(S.state, opts), opts.tickerId, opts.timeframe, opts.limit ?? undefined);
+    if (opts.liveAlerts) S.pine.setAlertMode('all');
     S.ind = __indicatorFor(source, opts.inputs);
     S.it = S.pine.run(S.ind, undefined, 1e9);
     r = await S.it.next();
@@ -587,7 +599,7 @@ function failure(out, isolate, bridge, logs, started) {
  * @param {number} [args.memoryMb]     isolate heap limit
  * @param {number} [args.maxPlotPoints]
  */
-export async function runPine({ source, tickerId, timeframe, limit = null, sDate = null, eDate = null, symbolInfo, fetchBars, timeoutMs = 10_000, memoryMb = 128, maxPlotPoints = 3000, maxSeriesBars = 3000, inputs = null }) {
+export async function runPine({ source, tickerId, timeframe, limit = null, sDate = null, eDate = null, symbolInfo, fetchBars, timeoutMs = 10_000, memoryMb = 128, maxPlotPoints = 3000, maxSeriesBars = 3000, inputs = null, liveAlerts = false }) {
   const started = performance.now();
   const logs = [];
   const bridge = { fetchBars, error: null };
@@ -597,7 +609,7 @@ export async function runPine({ source, tickerId, timeframe, limit = null, sDate
     const out = await withDeadline(isolate, timeoutMs, async () => {
       const context = await prepareContext(isolate, logs, bridge);
       setupMs = performance.now() - started;
-      return context.evalClosure(RUN_CLOSURE, [source, JSON.stringify({ tickerId, timeframe, limit, sDate, eDate, symbolInfo, maxPlotPoints, maxSeriesBars, inputs })], {
+      return context.evalClosure(RUN_CLOSURE, [source, JSON.stringify({ tickerId, timeframe, limit, sDate, eDate, symbolInfo, maxPlotPoints, maxSeriesBars, inputs, liveAlerts })], {
         arguments: { copy: true },
         result: { promise: true, copy: true },
       });
@@ -629,14 +641,14 @@ export class PineStream {
   }
 
   /** Same arguments and result fields as runPine, plus `stream` on success. */
-  static async open({ source, tickerId, timeframe, limit = null, symbolInfo, fetchBars, timeoutMs = 20_000, memoryMb = 256, maxPlotPoints = 400, maxSeriesBars = 3000, maxClosedTrades = 0, inputs = null }) {
+  static async open({ source, tickerId, timeframe, limit = null, symbolInfo, fetchBars, timeoutMs = 20_000, memoryMb = 256, maxPlotPoints = 400, maxSeriesBars = 3000, maxClosedTrades = 0, inputs = null, liveAlerts = false }) {
     const started = performance.now();
     const logs = [];
     const bridge = { fetchBars, error: null };
     const isolate = new ivm.Isolate({ memoryLimit: memoryMb });
     const out = await withDeadline(isolate, timeoutMs, async () => {
       const context = await prepareContext(isolate, logs, bridge);
-      const json = await context.evalClosure(STREAM_OPEN, [source, JSON.stringify({ tickerId, timeframe, limit, symbolInfo, maxPlotPoints, maxSeriesBars, maxClosedTrades, inputs })], {
+      const json = await context.evalClosure(STREAM_OPEN, [source, JSON.stringify({ tickerId, timeframe, limit, symbolInfo, maxPlotPoints, maxSeriesBars, maxClosedTrades, inputs, liveAlerts })], {
         arguments: { copy: true },
         result: { promise: true, copy: true },
       });

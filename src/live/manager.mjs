@@ -76,6 +76,7 @@ export class LiveManager {
       sessions: [...this.sessions.values()].map((s) => ({
         key: s.key, symbol: s.symbol, timeframe: s.timeframe, bars: s.bars.length, runs: s.runs, intrabarRuns: s.intrabarRuns, intrabarMs: s.intrabarMs, lastRunMs: s.lastRunMs, lastBoundaryMs: s.lastBoundaryMs ?? null, lastError: s.lastError,
         stream: this.streams ? { on: s.streamed, opens: s.streamOpens, bars: s.streamBars, heapMb: s.heapMb, off: s.streamOff || null, failures: s.streamFailures } : null,
+        alerts: { sent: s.alertsSent, dropped: s.alertsDropped },
         trading: s.trading ? { strategy: s.strategyName, activations: s.activations.length, live_accounts: s.activations.filter((a) => !a.is_paper).length, positions: liveSnapshot(s.ledger), shadow: s.shadowSignals, sent: s.signalsSent, failed: s.signalsFailed, lastLatencyMs: s.lastLatencyMs, recent: s.signalLog.slice(-10) } : null,
       })),
       trading: { enabled: !!this.config.tradingEnabled, execution: this.execution.stats },
@@ -146,6 +147,9 @@ export class LiveManager {
           key, id: it.strategy_code_id, strategyKey: it.strategy_key, symbol: it.symbol, timeframe: it.timeframe, seconds: atomikToSeconds(it.timeframe), source: it.source, symbolInfo: it.symbol_info || null,
           // Settings-dialog overrides ({in_N: value}); a change rebuilds the session.
           inputs, inputsKey,
+          // Alerts: the first run is the baseline (history never alerts); after
+          // that each alert is sent once (key = type|callsite|bar|message).
+          alertFloor: null, alertSeen: new Set(), alertTimes: [], alertsSent: 0, alertsDropped: 0,
           bars: [], warmed: false, runs: 0, intrabarRuns: 0, lastRunMs: null, lastError: null, lastHash: null, lastPayload: null, lastPartialHash: null, running: false, pending: false, wantBoundary: false, closedPending: false, closedAt: 0, dirty: false, lastIntrabarAt: 0, triggerAt: 0, intrabarMs: (this.config.liveIntrabarSeconds || 5) * 1000, intrabarNeeded: false,
           streamed: false, streamLast: null, streamBars: 0, streamOpens: 0, streamFailures: 0, streamOff: false, streamRetryAt: 0, heapMb: null,
           trading, activations, strategyName: it.strategy_name || null, ledger: newLedgerState(), outbox: Promise.resolve(), shadowSignals: 0, signalsSent: 0, signalsFailed: 0, signalLog: [], lastLatencyMs: null,
@@ -331,17 +335,22 @@ export class LiveManager {
           this.log.warn?.(`live: ${s.key} run failed: ${res.detail}`);
         } else {
           s.lastError = null;
+          const fresh = this.#newAlerts(s, res.live);
+          if (fresh.length) this.#sendAlerts(s, fresh);
           if (s.trading) s.intrabarNeeded = needsIntrabar(res.live.strategy);
           if (s.trading && res.live.strategy) {
             try { await this.#trade(s, res.live.strategy, { full: isFull, lastTime: res.live.lastTime, triggerAt }); } catch (err) { this.log.error?.(`live: ${s.key} trade step failed: ${err.message}`); }
           }
+          // New alerts ride on this run's frame (published even when nothing
+          // else changed) so an open chart pops them up; never cached.
+          const withAlerts = (p) => (fresh.length ? { ...p, alerts: fresh } : p);
           if (!chartFull) {
             const partial = partialStateFrom(res.live, { strategyKey: s.strategyKey, symbol: s.symbol });
             if (partial) {
               const hash = stateHash(partial);
-              if (hash !== s.lastPartialHash) {
+              if (hash !== s.lastPartialHash || fresh.length) {
                 s.lastPartialHash = hash;
-                await this.bus.publishState(partial, { cache: false });
+                await this.bus.publishState(withAlerts(partial), { cache: false });
               }
             }
           } else {
@@ -353,6 +362,7 @@ export class LiveManager {
               s.lastHash = hash;
               await this.bus.publishState(payload);
             }
+            if (fresh.length) await this.bus.publishState(withAlerts(payload), { cache: false });
           }
         }
         // Follow-ups that queued while this run was in flight.
@@ -374,6 +384,51 @@ export class LiveManager {
     } finally {
       s.running = false;
     }
+  }
+
+  /**
+   * The alerts of this run the session hasn't sent yet. The first run after a
+   * (re)build is the baseline: its alerts are history (or the bar it started
+   * on) and are only remembered. At most 20 a minute per session go out.
+   */
+  #newAlerts(s, live) {
+    const list = Array.isArray(live.alerts) ? live.alerts : [];
+    const keyOf = (a) => `${a.type}|${a.id}|${a.time}|${a.message ?? ''}|${a.title ?? ''}`;
+    if (s.alertFloor == null) {
+      s.alertFloor = typeof live.lastTime === 'number' ? live.lastTime : Date.now();
+      for (const a of list) s.alertSeen.add(keyOf(a));
+      return [];
+    }
+    const out = [];
+    const now = Date.now();
+    s.alertTimes = s.alertTimes.filter((t) => now - t < 60_000);
+    for (const a of list) {
+      if (typeof a.time !== 'number' || a.time < s.alertFloor) continue;
+      const k = keyOf(a);
+      if (s.alertSeen.has(k)) continue;
+      s.alertSeen.add(k);
+      if (s.alertTimes.length >= 20) { s.alertsDropped++; continue; }
+      s.alertTimes.push(now);
+      out.push(a);
+    }
+    if (s.alertSeen.size > 5000) s.alertSeen = new Set([...s.alertSeen].slice(-2000));
+    return out;
+  }
+
+  #sendAlerts(s, alerts) {
+    s.alertsSent += alerts.length;
+    this.log.info?.(`alert ${s.key}: ${alerts.map((a) => a.message || a.title || a.type).join(' | ').slice(0, 300)}`);
+    this.fetch(`${this.config.backendInternalUrl}/api/v1/internal/pine/alerts`, {
+      method: 'POST',
+      headers: { 'X-API-Key': this.config.serviceKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        strategy_code_id: s.id, symbol: s.symbol, timeframe: s.timeframe,
+        alerts: alerts.slice(0, 50).map((a) => ({ type: a.type, title: a.title, message: a.message, time: a.time })),
+      }),
+      signal: AbortSignal.timeout(15_000),
+    }).then((r) => {
+      if (!r.ok) this.log.warn?.(`alerts ${s.key}: backend -> ${r.status}`);
+    }).catch((err) => this.log.warn?.(`alerts ${s.key}: ${err.message}`));
   }
 
   /**
