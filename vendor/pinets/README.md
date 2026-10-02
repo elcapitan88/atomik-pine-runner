@@ -80,6 +80,14 @@ references (`$.var.…`, `$$.let.…`).
     `strategy.position_size[1]`, `ta.tr[1]` read the current value (`strategy.closedtrades >
     strategy.closedtrades[1]` never fired), and `plot(ta.sma(close, 3)[1])` plotted nothing.
 
+**Performance**
+
+23. **Timezone time helpers rebuilt `Intl.DateTimeFormat` on every call** (several per bar for scripts
+    using `hour()` / `time(tf, session, tz)` in a timezone) and re-converted the same bar time
+    repeatedly. One formatter per (site, timezone) plus a bounded memo of recent date parts:
+    "ICT Time + Price Levels (TradeJorno)" went from ~21s to ~2.9s for 5,000 bars (90s on the
+    production runner before). Results unchanged.
+
 PineTS's own suite gives the same result with and without the patch (no new failures);
 `test/pinets-patches.test.mjs` pins the cases here.
 

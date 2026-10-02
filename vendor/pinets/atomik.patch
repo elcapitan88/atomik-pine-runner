@@ -33,6 +33,72 @@ index 91d8ce1..0aab542 100644
          if (source != null && typeof source === 'object' && '__value' in source) {
              const inner = source.__value;
              // Dual-use helpers (time, time_close, ...) expose their backing Series.
+diff --git a/src/marketData/types.ts b/src/marketData/types.ts
+index e4bd70a..81de505 100644
+--- a/src/marketData/types.ts
++++ b/src/marketData/types.ts
+@@ -1,3 +1,4 @@
++import { cachedDateTimeFormat } from '../utils/intlCache';
+ // SPDX-License-Identifier: AGPL-3.0-only
+ 
+ /**
+@@ -184,12 +185,12 @@ export function localTimeToUTC(dateStr: string, timeStr: string, timezone: strin
+     // Use Intl to find the UTC offset for this timezone at this moment.
+     // Strategy: format the naive UTC time in the target timezone, parse back,
+     // compute the difference = the timezone's UTC offset.
+-    const formatter = new Intl.DateTimeFormat('en-US', {
++    const formatter = cachedDateTimeFormat(`offset|${timezone}`, () => new Intl.DateTimeFormat('en-US', {
+         timeZone: timezone,
+         year: 'numeric', month: '2-digit', day: '2-digit',
+         hour: '2-digit', minute: '2-digit', second: '2-digit',
+         hour12: false,
+-    });
++    }));
+ 
+     const parts = formatter.formatToParts(new Date(naiveUtcMs));
+     const get = (type: string) => parseInt(parts.find(p => p.type === type)!.value, 10);
+@@ -311,10 +312,10 @@ export function computeSessionClose(
+  * @internal
+  */
+ function _utcMsToLocalDate(utcMs: number, timezone: string): string {
+-    const formatter = new Intl.DateTimeFormat('en-CA', {
++    const formatter = cachedDateTimeFormat(`date|${timezone}`, () => new Intl.DateTimeFormat('en-CA', {
+         timeZone: timezone,
+         year: 'numeric', month: '2-digit', day: '2-digit',
+-    });
++    }));
+     return formatter.format(new Date(utcMs));
+ }
+ 
+diff --git a/src/namespaces/Core.ts b/src/namespaces/Core.ts
+index 49f5bb8..f4584cb 100644
+--- a/src/namespaces/Core.ts
++++ b/src/namespaces/Core.ts
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: AGPL-3.0-only
+ 
++import { cachedDateTimeFormat } from '../utils/intlCache';
+ import { Series } from '../Series';
+ import { PineTypeObject } from './PineTypeObject';
+ import { parseArgsForPineParams } from './utils';
+@@ -428,7 +429,7 @@ export class Core {
+         if (year >= 0 && year < 100) utcEstimate.setUTCFullYear(year);
+ 
+         // Format the estimate in the target timezone to extract its parts
+-        const formatter = new Intl.DateTimeFormat('en-US', {
++        const formatter = cachedDateTimeFormat(`iana|${timezone}`, () => new Intl.DateTimeFormat('en-US', {
+             timeZone: timezone,
+             year: 'numeric',
+             month: 'numeric',
+@@ -437,7 +438,7 @@ export class Core {
+             minute: 'numeric',
+             second: 'numeric',
+             hour12: false,
+-        });
++        }));
+ 
+         const parts = formatter.formatToParts(utcEstimate);
+         const get = (type: string) => parseInt(parts.find((p) => p.type === type)?.value || '0', 10);
 diff --git a/src/namespaces/Str.ts b/src/namespaces/Str.ts
 index 4d37162..f878e24 100644
 --- a/src/namespaces/Str.ts
@@ -65,10 +131,18 @@ index 4d37162..f878e24 100644
  
          return String(value);
 diff --git a/src/namespaces/Time.ts b/src/namespaces/Time.ts
-index 07e5f6f..289e159 100644
+index 07e5f6f..7a62b7a 100644
 --- a/src/namespaces/Time.ts
 +++ b/src/namespaces/Time.ts
-@@ -88,6 +88,44 @@ interface DateParts {
+@@ -4,6 +4,7 @@ import { Series } from '../Series';
+ import { parseArgsForPineParams } from './utils';
+ import { parseSessionSpec, isInSessionSpec } from './sessionSpec';
+ import { PineRuntimeError } from '../errors/PineRuntimeError';
++import { cachedDateTimeFormat } from '../utils/intlCache';
+ 
+ // ── Timeframe alignment utilities ───────────────────────────────────
+ 
+@@ -88,10 +89,51 @@ interface DateParts {
      dayOfWeek: number; // JS convention: 0=Sun, 1=Mon, ..., 6=Sat
  }
  
@@ -113,7 +187,61 @@ index 07e5f6f..289e159 100644
  /**
   * Decompose a UTC-millisecond timestamp into calendar parts
   * interpreted in the given timezone.
-@@ -263,6 +301,13 @@ export class TimeHelper {
+  */
++const PARTS_MEMO_MAX = 4096;
++const _partsMemo = new Map<string, DateParts>();
++
+ export function getDatePartsInTimezone(timestamp: number, timezone: string): DateParts {
+     const tzNorm = timezone.trim();
+ 
+@@ -128,9 +170,16 @@ export function getDatePartsInTimezone(timestamp: number, timezone: string): Dat
+         };
+     }
+ 
+-    // IANA timezone name — use Intl.DateTimeFormat
++    // IANA timezone name — use Intl.DateTimeFormat. A script reads the same
++    // bar time in the same zone many times per bar (hour(), minute(),
++    // dayofweek(), every time(tf, session, tz)), and formatToParts is the
++    // expensive part: recent results are remembered (bounded; a copy is
++    // returned so callers can't alter the memo).
++    const memoKey = `${timezone}|${timestamp}`;
++    const memo = _partsMemo.get(memoKey);
++    if (memo !== undefined) return { ...memo };
+     try {
+-        const formatter = new Intl.DateTimeFormat('en-US', {
++        const formatter = cachedDateTimeFormat(`parts|${timezone}`, () => new Intl.DateTimeFormat('en-US', {
+             timeZone: timezone,
+             year: 'numeric',
+             month: 'numeric',
+@@ -140,7 +189,7 @@ export function getDatePartsInTimezone(timestamp: number, timezone: string): Dat
+             second: 'numeric',
+             weekday: 'short',
+             hour12: false,
+-        });
++        }));
+         const parts = formatter.formatToParts(new Date(timestamp));
+         const get = (type: string) => parseInt(parts.find((p) => p.type === type)?.value || '0', 10);
+ 
+@@ -150,7 +199,7 @@ export function getDatePartsInTimezone(timestamp: number, timezone: string): Dat
+         const weekdayStr = parts.find((p) => p.type === 'weekday')?.value || 'Sun';
+         const dayMap: Record<string, number> = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+ 
+-        return {
++        const result: DateParts = {
+             year: get('year'),
+             month: get('month'),
+             day: get('day'),
+@@ -159,6 +208,9 @@ export function getDatePartsInTimezone(timestamp: number, timezone: string): Dat
+             second: get('second'),
+             dayOfWeek: dayMap[weekdayStr] ?? 0,
+         };
++        if (_partsMemo.size >= PARTS_MEMO_MAX) _partsMemo.clear();
++        _partsMemo.set(memoKey, result);
++        return { ...result };
+     } catch {
+         // Fallback to UTC on error
+         const d = new Date(timestamp);
+@@ -263,6 +315,13 @@ export class TimeHelper {
              htfBarTime = alignToTimeframe(currentTime, normalizedTF);
          }
  
@@ -1256,6 +1384,52 @@ index cfc1576..b3da133 100644
                  scopeManager.setVarStaticType(paramName, typeName);
              }
          }
+diff --git a/src/utils/intlCache.ts b/src/utils/intlCache.ts
+new file mode 100644
+index 0000000..b4c9670
+--- /dev/null
++++ b/src/utils/intlCache.ts
+@@ -0,0 +1,20 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++
++/**
++ * Intl.DateTimeFormat instances are expensive to build (tens of µs to ms) and
++ * immutable once built, yet the time helpers used to construct one on every
++ * call: several per bar for scripts that read hour()/time(tf, session, tz) in
++ * a timezone. One instance per (call site, timezone) is reused instead.
++ * Only successful constructions are cached: an invalid timezone still throws
++ * at the call site, as before.
++ */
++const formatters = new Map<string, Intl.DateTimeFormat>();
++
++export function cachedDateTimeFormat(key: string, make: () => Intl.DateTimeFormat): Intl.DateTimeFormat {
++    let formatter = formatters.get(key);
++    if (formatter === undefined) {
++        formatter = make();
++        formatters.set(key, formatter);
++    }
++    return formatter;
++}
+diff --git a/tests/core/atomik-intl-cache.test.ts b/tests/core/atomik-intl-cache.test.ts
+new file mode 100644
+index 0000000..b6f4a17
+--- /dev/null
++++ b/tests/core/atomik-intl-cache.test.ts
+@@ -0,0 +1,14 @@
++import { describe, it, expect } from 'vitest';
++import { getDatePartsInTimezone } from '../../src/namespaces/Time';
++
++describe('timezone date parts are cached safely', () => {
++    it('returns the same parts on repeat calls, and a copy each time', () => {
++        const t = Date.UTC(2026, 9, 1, 22, 30); // 17:30 America/Chicago (CDT)
++        const a = getDatePartsInTimezone(t, 'America/Chicago');
++        expect(a).toMatchObject({ year: 2026, month: 10, day: 1, hour: 17, minute: 30, dayOfWeek: 4 });
++        a.hour = 99; // a caller mutating its result must not poison the memo
++        const b = getDatePartsInTimezone(t, 'America/Chicago');
++        expect(b.hour).toBe(17);
++        expect(getDatePartsInTimezone(t, 'America/New_York').hour).toBe(18);
++    });
++});
 diff --git a/tests/namespaces/request-fundamentals-na.test.ts b/tests/namespaces/request-fundamentals-na.test.ts
 new file mode 100644
 index 0000000..c15802d
