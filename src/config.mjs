@@ -58,6 +58,13 @@ export const config = {
   // Re-publish unchanged state this often so a chart opened between bar closes
   // catches up even when its own catch-up request is lost.
   liveHeartbeatSeconds: int('PINE_LIVE_HEARTBEAT_SECONDS', 60),
+  // Rich drawings: box/line/label objects go to the chart with their full
+  // style (colors, borders, any-angle lines, text at the point) instead of
+  // plain teal boxes plus price levels. OFF until a frontend that draws them
+  // is live: older charts would draw the new kinds as teal rectangles.
+  richDrawings: env.PINE_RICH_DRAWINGS === 'true',
+  // Newest objects of each kind sent per frame (TradingView allows 500).
+  maxDrawings: int('PINE_MAX_DRAWINGS', 300),
   // Trading: send signals for activated Pine strategies to the backend's
   // /api/v1/trades/execute. OFF unless explicitly enabled; the key is the
   // strategy engine's (the same one DataHub accepts).

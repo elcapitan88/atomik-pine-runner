@@ -4,11 +4,15 @@
 import { describe, it, expect } from 'vitest';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { streamThrough, trades, opens, pending, boxes, lines, labels, plotValues, median } from './stream-harness.mjs';
+import { richDrawings } from '../src/live/state.mjs';
 
 const DIR = new URL('../private-fixtures/', import.meta.url);
 // A countdown label built from `timenow` ("(17:34:09)", "(2D 04:19:09)") reads
 // the wall clock, so two runs a second apart differ: compare it as a countdown.
-const clockless = (ls) => ls.map(([t, price, text]) => [t, price, typeof text === 'string' ? text.replace(/\((\d+D )?\d+(:\d+)*\)/g, '(countdown)') : text]);
+const countdown = (text) => (typeof text === 'string' ? text.replace(/\((\d+D )?\d+(:\d+)*\)/g, '(countdown)') : text);
+const clockless = (ls) => ls.map(([t, price, text]) => [t, price, countdown(text)]);
+// The chart's rich drawings (PINE_RICH_DRAWINGS): same objects, same ids.
+const rich = (r) => richDrawings(r.drawings).map((d) => (d.kind === 'label' ? { ...d, text: countdown(d.text) } : d));
 const files = existsSync(DIR) ? readdirSync(DIR).filter((f) => f.endsWith('.pine')) : [];
 
 describe.skipIf(!files.length)('streaming parity on private scripts', () => {
@@ -32,6 +36,7 @@ describe.skipIf(!files.length)('streaming parity on private scripts', () => {
         expect(boxes(r.streamed)).toEqual(boxes(r.oneShot));
         expect(lines(r.streamed)).toEqual(lines(r.oneShot));
         expect(clockless(labels(r.streamed))).toEqual(clockless(labels(r.oneShot)));
+        expect(rich(r.streamed)).toEqual(rich(r.oneShot));
         console.log(`${f}: open ${r.first.ms}ms, one-shot ${r.oneShot.ms}ms, update median ${median(r.times)}ms max ${Math.max(...r.times)}ms, trades ${trades(r.oneShot).length}`);
       } finally {
         r.stream?.dispose();

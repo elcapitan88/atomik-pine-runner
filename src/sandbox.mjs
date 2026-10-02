@@ -273,17 +273,62 @@ globalThis.__extract = (ctx, source, opts) => {
     const shapes = [];
     let barByTime = null;
     const drawings = { boxes: [], lines: [], labels: [] };
+    // Style fields pass through as PineTS holds them (colors '#RRGGBBAA' or
+    // 'rgba(...)', '' = default, null = na; 'style_*' names; size names or
+    // numbers); state.mjs normalises them for the chart.
+    const str = (v) => (typeof v === 'string' ? v : (v == null || (typeof v === 'number' && !Number.isFinite(v)) ? null : String(v)));
+    const width = (v) => (isNum(v) ? v : null);
+    const size = (v) => (isNum(v) ? v : str(v));
+    // Open time of the bar each object was created on (\`at\`). PineTS ids are
+    // global counters that move every time the forming bar re-executes, so the
+    // chart keys drawings by creation bar + order instead. The plot copies
+    // drop _createdAtBar; the helpers hold the live objects.
+    const born = { boxes: new Map(), lines: new Map(), labels: new Map() };
+    for (const h of ctx._drawingHelpers || []) {
+      for (const [k, arr] of [['boxes', h && h._boxes], ['lines', h && h._lines], ['labels', h && h._labels]]) {
+        if (Array.isArray(arr)) for (const o of arr) if (o && isNum(o._createdAtBar)) born[k].set(o.id, o._createdAtBar);
+      }
+    }
+    const bornAt = (kind, o) => { const i = born[kind].get(o.id); return isNum(i) && i >= 0 && i < n ? md[i].openTime : null; };
+    // The bar a label at yloc.abovebar / belowbar sits on.
+    const barAt = (x, xloc) => {
+      if (!isNum(x)) return null;
+      if (xloc === 'bt' || xloc === 'bar_time' || x > 1e11) {
+        if (!barByTime) barByTime = new Map(md.map((b) => [b.openTime, b]));
+        return barByTime.get(x) || null;
+      }
+      const i = Math.round(x);
+      return i >= 0 && i < n ? md[i] : null;
+    };
+    const DRAWING_PLOTS = { __boxes__: 'boxes', __boxes_overlay__: 'boxes', __lines__: 'lines', __lines_overlay__: 'lines', __labels__: 'labels', __labels_overlay__: 'labels' };
     for (const [name, plot] of Object.entries(ctx.plots || {})) {
       const data = (plot && plot.data) || [];
-      if (name === '__boxes__' || name === '__lines__' || name === '__labels__') {
+      const kind = DRAWING_PLOTS[name];
+      if (kind) {
         const last = data.length ? data[data.length - 1].value : null;
         const items = Array.isArray(last) ? last.filter((d) => d && !d._deleted) : [];
-        if (name === '__boxes__') {
-          for (const b of items) drawings.boxes.push({ id: b.id, t1: xToTime(b.left, b.xloc), t2: xToTime(b.right, b.xloc), top: b.top, bottom: b.bottom, color: b.bgcolor || b.border_color || null, text: b.text || '' });
-        } else if (name === '__lines__') {
-          for (const l of items) drawings.lines.push({ id: l.id, t1: xToTime(l.x1, l.xloc), t2: xToTime(l.x2, l.xloc), p1: l.y1, p2: l.y2, color: l.color || null, style: l.style || null, extend: l.extend || 'none' });
+        if (kind === 'boxes') {
+          for (const b of items) {
+            drawings.boxes.push({
+              id: b.id, at: bornAt('boxes', b), t1: xToTime(b.left, b.xloc), t2: xToTime(b.right, b.xloc), top: b.top, bottom: b.bottom, color: b.bgcolor || b.border_color || null, text: b.text || '',
+              bgcolor: str(b.bgcolor), border_color: str(b.border_color), border_width: width(b.border_width), border_style: str(b.border_style), extend: str(b.extend),
+              text_color: str(b.text_color), text_size: size(b.text_size), text_halign: str(b.text_halign), text_valign: str(b.text_valign),
+            });
+          }
+        } else if (kind === 'lines') {
+          for (const l of items) drawings.lines.push({ id: l.id, at: bornAt('lines', l), t1: xToTime(l.x1, l.xloc), t2: xToTime(l.x2, l.xloc), p1: l.y1, p2: l.y2, color: str(l.color), style: l.style || null, extend: l.extend || 'none', width: width(l.width) });
         } else {
-          for (const l of items) drawings.labels.push({ id: l.id, t: xToTime(l.x, l.xloc), price: isNum(l.y) ? l.y : null, text: l.text || '', style: l.style || null });
+          for (const l of items) {
+            const yloc = str(l.yloc);
+            const above = yloc === 'ab' || yloc === 'abovebar';
+            const below = yloc === 'bl' || yloc === 'belowbar';
+            const bar = above || below ? barAt(l.x, l.xloc) : null;
+            drawings.labels.push({
+              id: l.id, at: bornAt('labels', l), t: xToTime(l.x, l.xloc), price: bar ? (above ? bar.high : bar.low) : (isNum(l.y) ? l.y : null), text: l.text || '', style: l.style || null,
+              color: str(l.color), textcolor: str(l.textcolor), size: size(l.size), textalign: str(l.textalign),
+              yloc: above ? 'abovebar' : below ? 'belowbar' : 'price', tooltip: str(l.tooltip),
+            });
+          }
         }
         continue;
       }
@@ -312,6 +357,9 @@ globalThis.__extract = (ctx, source, opts) => {
       }
       plots[name] = { color: o.color || null, style: o.style || null, points, total: data.length };
     }
+
+    // force_overlay objects sit in their own plot entries: back to creation order.
+    for (const k of ['boxes', 'lines', 'labels']) drawings[k].sort((a, b) => a.id - b.id);
 
     // Native-study series: every plot/hline/fill/barcolor/bgcolor as values
     // aligned on ONE time axis (the last maxSeriesBars bars), plus per-bar

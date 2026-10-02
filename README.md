@@ -68,6 +68,8 @@ HTTP request ─▶ server.mjs (auth, validation) ─▶ pool.mjs ─▶ worker.
 | `PINE_LIVE_STREAM_RECYCLE_BARS` | `2000` | reopen a stream from history once it grew this many bars past the warmup |
 | `PINE_LIVE_INTRABAR_SECONDS` | `5` | min seconds between forming-bar re-runs of a NON-streamed session (trading sessions drop to 1s only while an order can fill mid-bar) |
 | `PINE_LIVE_HEARTBEAT_SECONDS` | `60` | full-state re-publish so open charts catch up |
+| `PINE_RICH_DRAWINGS` | `false` | send `box.new`/`line.new`/`label.new` objects with their full style (`kind: 'box' \| 'line' \| 'label'`, see `src/live/state.mjs`); off = plain boxes, with horizontal lines and labels as price levels. Turn on only once the chart draws the new kinds |
+| `PINE_MAX_DRAWINGS` | `300` | newest boxes, lines and labels (each) sent per chart frame when rich drawings are on |
 | `PINE_TRADING_ENABLED` | `false` | send signals for activated strategies; unset = shadow mode (signals are only logged) |
 | `EXECUTION_API_KEY` | `DATAHUB_API_KEY` | key for the backend's signal endpoint (the strategy engine's key) |
 
