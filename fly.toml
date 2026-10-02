@@ -16,6 +16,9 @@ primary_region = "iad"
   PORT = "8000"
   ENVIRONMENT = "production"
   PINE_WORKERS = "2"
+  # Per-script isolate ceiling (default 256). "Liquidity Swings [LuxAlgo]" needs
+  # ~300MB over a 5,000-bar chart history and was abandoned at 256 (Oct 1).
+  PINE_ISOLATE_MEMORY_MB = "512"
 
 [http_service]
   internal_port = 8000
