@@ -32,10 +32,13 @@ primary_region = "iad"
     method = "GET"
     path = "/health"
 
+# A dedicated core: shared CPUs are throttled to a small baseline once their
+# burst credit runs out, and live chart sessions are steady load (launch night
+# Oct 1: 45s timeouts, OOM-killed stream worker on shared-cpu-1x/1GB).
 [[vm]]
-  cpu_kind = "shared"
+  cpu_kind = "performance"
   cpus = 1
-  memory_mb = 1024
+  memory_mb = 2048
 
 [[restart]]
   policy = "always"
