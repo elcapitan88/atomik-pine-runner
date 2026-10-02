@@ -34,7 +34,7 @@ export function upsert(live, bar) {
   else live.push(bar);
 }
 
-export const baseOpts = { tickerId: 'NQ', symbolInfo, timeoutMs: 60_000, memoryMb: 256, maxPlotPoints: 400 };
+export const baseOpts = { tickerId: 'NQ', symbolInfo, timeoutMs: 60_000, memoryMb: 512, maxPlotPoints: 400 }; // = production PINE_ISOLATE_MEMORY_MB
 
 /**
  * @returns {{first, streamed, oneShot, times: number[], stream: PineStream|null, error?: string}}
