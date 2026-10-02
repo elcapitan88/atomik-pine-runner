@@ -1,0 +1,1662 @@
+diff --git a/src/Series.ts b/src/Series.ts
+index 91d8ce1..0aab542 100644
+--- a/src/Series.ts
++++ b/src/Series.ts
+@@ -35,6 +35,14 @@ export class Series {
+     static from(source: any): Series {
+         if (source instanceof Series) return source;
+         if (Array.isArray(source)) return new Series(source);
++        // `strategy.opentrades` / `strategy.closedtrades` are hybrid objects (a
++        // trade count via Symbol.toPrimitive, plus per-trade methods). Read as a
++        // VALUE (`plot(strategy.closedtrades)`, `strategy.opentrades == 0`,
++        // `str.tostring(strategy.closedtrades)`) they are that count — the
++        // object itself made plot() drop its signature and `==` always false.
++        if (source != null && typeof source === 'object' && typeof source[Symbol.toPrimitive] === 'function') {
++            return new Series([source[Symbol.toPrimitive]('number')]);
++        }
+         if (source != null && typeof source === 'object' && '__value' in source) {
+             const inner = source.__value;
+             // Dual-use helpers (time, time_close, ...) expose their backing Series.
+diff --git a/src/namespaces/Str.ts b/src/namespaces/Str.ts
+index 4d37162..f878e24 100644
+--- a/src/namespaces/Str.ts
++++ b/src/namespaces/Str.ts
+@@ -55,15 +55,24 @@ export class Str {
+         // Pattern-based format: "#", "#.#", "#.##", "0.000", etc.
+         // Count decimal places from the pattern
+         const dotIdx = formatStr.indexOf('.');
++        // Each `0` left of the decimal point is a required integer digit:
++        // str.tostring(9, "00") → "09" (a countdown's "05:09"), as on TradingView.
++        const minIntDigits = ((dotIdx >= 0 ? formatStr.substring(0, dotIdx) : formatStr).match(/0/g) || []).length;
++        const padInt = (s: string): string => {
++            if (minIntDigits <= 1) return s;
++            const neg = s.startsWith('-');
++            const [intDigits, frac] = (neg ? s.slice(1) : s).split('.');
++            return (neg ? '-' : '') + intDigits.padStart(minIntDigits, '0') + (frac !== undefined ? '.' + frac : '');
++        };
+         if (dotIdx >= 0) {
+             const decimalPart = formatStr.substring(dotIdx + 1);
+             const decimals = decimalPart.length;
+-            return value.toFixed(decimals);
++            return padInt(value.toFixed(decimals));
+         }
+ 
+         // No decimal point in format → integer
+         if (formatStr.includes('#') || formatStr.includes('0')) {
+-            return String(Math.round(value));
++            return padInt(String(Math.round(value)));
+         }
+ 
+         return String(value);
+diff --git a/src/namespaces/Time.ts b/src/namespaces/Time.ts
+index 07e5f6f..3e536b1 100644
+--- a/src/namespaces/Time.ts
++++ b/src/namespaces/Time.ts
+@@ -263,6 +263,13 @@ export class TimeHelper {
+             htfBarTime = alignToTimeframe(currentTime, normalizedTF);
+         }
+ 
++        // A timezone passed in the session slot (`time("60", "America/New_York")`
++        // — common in published scripts, accepted by TradingView) is not a
++        // session filter: ignore it rather than halt.
++        if (typeof parsed.session === 'string' && /^[A-Za-z_]+\/[A-Za-z_\/+-]+$/.test(parsed.session) && !parseSessionSpec(parsed.session)) {
++            return htfBarTime;
++        }
++
+         // Session filtering
+         if (parsed.session !== undefined && parsed.session !== '') {
+             const timezone = parsed.timezone || this.context.pine?.syminfo?.timezone || 'UTC';
+diff --git a/src/namespaces/request/methods/currency_rate.ts b/src/namespaces/request/methods/currency_rate.ts
+new file mode 100644
+index 0000000..180c87f
+--- /dev/null
++++ b/src/namespaces/request/methods/currency_rate.ts
+@@ -0,0 +1,14 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++
++/**
++ * `request.currency_rate(from, to)` — no FX feed is available, so a conversion
++ * between two different currencies is `na`; the same currency converts at 1
++ * (the common `request.currency_rate(syminfo.currency, "USD")` on a USD symbol).
++ */
++export function currency_rate(context: any) {
++    return (from: any, to: any, ..._rest: any[]) => {
++        const f = Array.isArray(from) ? from[0] : from;
++        const t = Array.isArray(to) ? to[0] : to;
++        return typeof f === 'string' && typeof t === 'string' && f.toUpperCase() === t.toUpperCase() ? 1 : NaN;
++    };
++}
+diff --git a/src/namespaces/request/methods/dividends.ts b/src/namespaces/request/methods/dividends.ts
+new file mode 100644
+index 0000000..c062eb0
+--- /dev/null
++++ b/src/namespaces/request/methods/dividends.ts
+@@ -0,0 +1,13 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++
++/**
++ * `request.dividends(...)` — fundamental / corporate-event data is not available
++ * from PineTS data providers, so the call returns `na` on every bar. That is
++ * also what TradingView returns for symbols without such data (futures,
++ * crypto, forex), and it lets scripts that merely reference the function
++ * (e.g. the built-in VWAP's "Earnings"/"Dividends" anchors) run instead of
++ * failing with "request.dividends is not a function".
++ */
++export function dividends(context: any) {
++    return (..._args: any[]) => NaN;
++}
+diff --git a/src/namespaces/request/methods/earnings.ts b/src/namespaces/request/methods/earnings.ts
+new file mode 100644
+index 0000000..0bba41a
+--- /dev/null
++++ b/src/namespaces/request/methods/earnings.ts
+@@ -0,0 +1,13 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++
++/**
++ * `request.earnings(...)` — fundamental / corporate-event data is not available
++ * from PineTS data providers, so the call returns `na` on every bar. That is
++ * also what TradingView returns for symbols without such data (futures,
++ * crypto, forex), and it lets scripts that merely reference the function
++ * (e.g. the built-in VWAP's "Earnings"/"Dividends" anchors) run instead of
++ * failing with "request.earnings is not a function".
++ */
++export function earnings(context: any) {
++    return (..._args: any[]) => NaN;
++}
+diff --git a/src/namespaces/request/methods/economic.ts b/src/namespaces/request/methods/economic.ts
+new file mode 100644
+index 0000000..cdedfc4
+--- /dev/null
++++ b/src/namespaces/request/methods/economic.ts
+@@ -0,0 +1,13 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++
++/**
++ * `request.economic(...)` — fundamental / corporate-event data is not available
++ * from PineTS data providers, so the call returns `na` on every bar. That is
++ * also what TradingView returns for symbols without such data (futures,
++ * crypto, forex), and it lets scripts that merely reference the function
++ * (e.g. the built-in VWAP's "Earnings"/"Dividends" anchors) run instead of
++ * failing with "request.economic is not a function".
++ */
++export function economic(context: any) {
++    return (..._args: any[]) => NaN;
++}
+diff --git a/src/namespaces/request/methods/financial.ts b/src/namespaces/request/methods/financial.ts
+new file mode 100644
+index 0000000..1fad3e3
+--- /dev/null
++++ b/src/namespaces/request/methods/financial.ts
+@@ -0,0 +1,13 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++
++/**
++ * `request.financial(...)` — fundamental / corporate-event data is not available
++ * from PineTS data providers, so the call returns `na` on every bar. That is
++ * also what TradingView returns for symbols without such data (futures,
++ * crypto, forex), and it lets scripts that merely reference the function
++ * (e.g. the built-in VWAP's "Earnings"/"Dividends" anchors) run instead of
++ * failing with "request.financial is not a function".
++ */
++export function financial(context: any) {
++    return (..._args: any[]) => NaN;
++}
+diff --git a/src/namespaces/request/methods/param.ts b/src/namespaces/request/methods/param.ts
+index b401b4c..4a95c5f 100644
+--- a/src/namespaces/request/methods/param.ts
++++ b/src/namespaces/request/methods/param.ts
+@@ -25,8 +25,17 @@ export function param(context: any) {
+             const isTuple = (hasAnySeries || hasOnlyScalars) && source.length >= 1;
+ 
+             if (isTuple) {
+-                // Extract current value from each element (Series → .get(0), scalars pass through)
+-                val = source.map((elem: any) => elem instanceof Series ? elem.get(0) : elem);
++                // Extract current value from each element (Series → .get(0), scalars pass through).
++                // Built-ins that are helper objects (`time`, `time_close`, `dayofweek`, `na`, …)
++                // reach a tuple bare — `[time, time_close]` — so read their `__value` Series.
++                val = source.map((elem: any) => {
++                    if (elem instanceof Series) return elem.get(0);
++                    if (elem && typeof elem === 'object' && !Array.isArray(elem) && '__value' in elem) {
++                        const v = elem.__value;
++                        return v instanceof Series ? v.get(0) : v;
++                    }
++                    return elem;
++                });
+             } else {
+                 // Time-series array - extract value at index
+                 val = Series.from(source).get(index || 0);
+diff --git a/src/namespaces/request/methods/quandl.ts b/src/namespaces/request/methods/quandl.ts
+new file mode 100644
+index 0000000..dc25132
+--- /dev/null
++++ b/src/namespaces/request/methods/quandl.ts
+@@ -0,0 +1,13 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++
++/**
++ * `request.quandl(...)` — fundamental / corporate-event data is not available
++ * from PineTS data providers, so the call returns `na` on every bar. That is
++ * also what TradingView returns for symbols without such data (futures,
++ * crypto, forex), and it lets scripts that merely reference the function
++ * (e.g. the built-in VWAP's "Earnings"/"Dividends" anchors) run instead of
++ * failing with "request.quandl is not a function".
++ */
++export function quandl(context: any) {
++    return (..._args: any[]) => NaN;
++}
+diff --git a/src/namespaces/request/methods/splits.ts b/src/namespaces/request/methods/splits.ts
+new file mode 100644
+index 0000000..ccc12e9
+--- /dev/null
++++ b/src/namespaces/request/methods/splits.ts
+@@ -0,0 +1,13 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++
++/**
++ * `request.splits(...)` — fundamental / corporate-event data is not available
++ * from PineTS data providers, so the call returns `na` on every bar. That is
++ * also what TradingView returns for symbols without such data (futures,
++ * crypto, forex), and it lets scripts that merely reference the function
++ * (e.g. the built-in VWAP's "Earnings"/"Dividends" anchors) run instead of
++ * failing with "request.splits is not a function".
++ */
++export function splits(context: any) {
++    return (..._args: any[]) => NaN;
++}
+diff --git a/src/namespaces/request/request.index.ts b/src/namespaces/request/request.index.ts
+index 0321c00..5da5e35 100644
+--- a/src/namespaces/request/request.index.ts
++++ b/src/namespaces/request/request.index.ts
+@@ -2,24 +2,45 @@
+ // This file is auto-generated. Do not edit manually.
+ // Run: npm run generate:request-index
+ 
++import { currency_rate } from './methods/currency_rate';
++import { dividends } from './methods/dividends';
++import { earnings } from './methods/earnings';
++import { economic } from './methods/economic';
++import { financial } from './methods/financial';
+ import { footprint } from './methods/footprint';
+ import { param } from './methods/param';
++import { quandl } from './methods/quandl';
+ import { security } from './methods/security';
+ import { security_lower_tf } from './methods/security_lower_tf';
++import { splits } from './methods/splits';
+ 
+ const methods = {
++  currency_rate,
++  dividends,
++  earnings,
++  economic,
++  financial,
+   footprint,
+   param,
++  quandl,
+   security,
+-  security_lower_tf
++  security_lower_tf,
++  splits
+ };
+ 
+ export class PineRequest {
+   private _cache = {};
++  currency_rate: ReturnType<typeof methods.currency_rate>;
++  dividends: ReturnType<typeof methods.dividends>;
++  earnings: ReturnType<typeof methods.earnings>;
++  economic: ReturnType<typeof methods.economic>;
++  financial: ReturnType<typeof methods.financial>;
+   footprint: ReturnType<typeof methods.footprint>;
+   param: ReturnType<typeof methods.param>;
++  quandl: ReturnType<typeof methods.quandl>;
+   security: ReturnType<typeof methods.security>;
+   security_lower_tf: ReturnType<typeof methods.security_lower_tf>;
++  splits: ReturnType<typeof methods.splits>;
+ 
+   constructor(private context: any) {
+     // Install methods
+diff --git a/src/namespaces/ta/methods/vwap.ts b/src/namespaces/ta/methods/vwap.ts
+index f2415c4..fca111c 100644
+--- a/src/namespaces/ta/methods/vwap.ts
++++ b/src/namespaces/ta/methods/vwap.ts
+@@ -18,6 +18,14 @@ import { getDatePartsInTimezone } from '../../Time';
+  */
+ export function vwap(context: any) {
+     return (source: any, _callId?: string) => {
++        // Bare `ta.vwap` (the built-in variable, e.g. `src = ta.vwap`) is
++        // lowered to `ta.vwap()` — or `ta.vwap('<callId>')` when hoisted — and
++        // means `ta.vwap(hlc3)`. Without a source every bar was NaN.
++        if (_callId === undefined && typeof source === 'string' && /_ta\d+$/.test(source)) {
++            _callId = source;
++            source = undefined;
++        }
++        if (source === undefined) source = context.data.hlc3;
+         // VWAP calculation using cumulative sums
+         if (!context.taState) context.taState = {};
+         const stateKey = _callId || `vwap`;
+diff --git a/src/namespaces/utils.ts b/src/namespaces/utils.ts
+index 037b829..24813cf 100644
+--- a/src/namespaces/utils.ts
++++ b/src/namespaces/utils.ts
+@@ -6,7 +6,9 @@ function isPlot(arg: any) {
+     return typeof arg === 'object' && arg && (arg.title !== undefined || arg._plotKey !== undefined) && arg.data !== undefined && arg.options !== undefined;
+ }
+ const TYPE_CHECK = {
+-    series: (arg) => arg instanceof Series || typeof arg === 'number' || typeof arg === 'string' || typeof arg === 'boolean',
++    // (A `strategy.opentrades` / `strategy.closedtrades` hybrid is a series int: its trade count.)
++    series: (arg) => arg instanceof Series || typeof arg === 'number' || typeof arg === 'string' || typeof arg === 'boolean' ||
++        (arg != null && typeof arg === 'object' && typeof arg[Symbol.toPrimitive] === 'function'),
+     string: (arg) => typeof arg === 'string',
+     // Pine Script color params accept both color strings and `na` (NaN).
+     // Using 'color' instead of 'string' prevents NaN from invalidating the signature.
+@@ -30,7 +32,8 @@ const TYPE_CHECK = {
+     // objects — never arrays. Excluding arrays here lets functions like
+     // request.security accept tuple expressions (e.g. `[o, c]`) as a positional
+     // arg without misinterpreting them as the options bag.
+-    remaining_options: (arg) => arg !== null && typeof arg === 'object' && !Array.isArray(arg) && !(arg instanceof Series) && !(arg instanceof ChartPointObject) && !isPlot(arg),
++    remaining_options: (arg) => arg !== null && typeof arg === 'object' && !Array.isArray(arg) && !(arg instanceof Series) && !(arg instanceof ChartPointObject) && !isPlot(arg) &&
++        typeof arg[Symbol.toPrimitive] !== 'function',
+ };
+ 
+ export type PineTypeMap<T> = {
+diff --git a/src/transpiler/analysis/ScopeManager.ts b/src/transpiler/analysis/ScopeManager.ts
+index ebe1c26..f64ca32 100644
+--- a/src/transpiler/analysis/ScopeManager.ts
++++ b/src/transpiler/analysis/ScopeManager.ts
+@@ -59,6 +59,21 @@ export function normalizePineBaseType(pineType: string | undefined): string | un
+     return parts.length > 0 ? parts[parts.length - 1] : undefined;
+ }
+ 
++/**
++ * Element type of a Pine array type annotation, qualifiers stripped:
++ *   'array<Gap>' → 'Gap', 'Gap[]' → 'Gap', 'series array<float>' → 'float'.
++ * Anything that is not a one-dimensional array type gives undefined.
++ */
++export function pineArrayElementType(pineType: string | undefined): string | undefined {
++    if (!pineType || typeof pineType !== 'string') return undefined;
++    const parts = pineType.trim().split(/\s+/).filter(Boolean);
++    const t = parts.length > 0 ? parts.slice(-1)[0] : '';
++    let m = t.match(/^array<([A-Za-z_$][\w$.]*)>$/);
++    if (m) return m[1];
++    m = t.match(/^([A-Za-z_$][\w$.]*)\[\]$/);
++    return m ? m[1] : undefined;
++}
++
+ export class ScopeManager {
+     private scopes: Map<string, string>[] = [];
+     private scopeTypes: string[] = [];
+@@ -167,6 +182,9 @@ export class ScopeManager {
+      * type matches the method's declared first-parameter type (TV semantics).
+      */
+     private varStaticTypes: Map<string, string> = new Map();
++    // Full (un-normalized) annotation behind each `varStaticTypes` entry, so
++    // the element type of `array<T>` / `T[]` stays available.
++    private varStaticTypesRaw: Map<string, string> = new Map();
+ 
+     /**
+      * Registry of user `method` Pine names → declared receiver BASE type
+@@ -382,15 +400,29 @@ export class ScopeManager {
+ 
+     setVarStaticType(varName: string, pineType: string): void {
+         const base = normalizePineBaseType(pineType);
+-        if (base) this.varStaticTypes.set(varName, base);
++        if (base) {
++            this.varStaticTypes.set(varName, base);
++            this.varStaticTypesRaw.set(varName, pineType);
++        }
+     }
+ 
+     getVarStaticType(varName: string): string | undefined {
+         return this.varStaticTypes.get(varName);
+     }
+ 
++    /** The annotation as registered (`array<Gap>`), for save/restore. */
++    getVarStaticTypeRaw(varName: string): string | undefined {
++        return this.varStaticTypesRaw.get(varName);
++    }
++
++    /** Element type of an array-typed variable (`array<Gap>` → `Gap`). */
++    getVarElementType(varName: string): string | undefined {
++        return pineArrayElementType(this.varStaticTypesRaw.get(varName));
++    }
++
+     unsetVarStaticType(varName: string): void {
+         this.varStaticTypes.delete(varName);
++        this.varStaticTypesRaw.delete(varName);
+     }
+ 
+     setMethodReceiverType(pineName: string, pineType: string): void {
+@@ -510,6 +542,26 @@ export class ScopeManager {
+         return newName;
+     }
+ 
++    /**
++     * Declare a function parameter in the current (function) scope under its
++     * own, unrenamed name. A parameter shadows any outer variable of the same
++     * name (e.g. `manage(kz kz)` where `kz` is also a global UDT type), so a
++     * lookup from inside the body must stop here instead of resolving to the
++     * global (`$.const.glb1_kz`).
++     */
++    declareFunctionParam(name: string): void {
++        this.scopes[this.scopes.length - 1].set(name, name);
++    }
++
++    /** True when `name` resolves to a parameter of an enclosing function. */
++    isFunctionParam(name: string): boolean {
++        for (let i = this.scopes.length - 1; i >= 0; i--) {
++            const scoped = this.scopes[i].get(name);
++            if (scoped !== undefined) return scoped === name && this.localSeriesVars.has(name);
++        }
++        return false;
++    }
++
+     getVariable(name: string): [string, string] {
+         // If it's a loop variable, return it as is
+         if (this.loopVars.has(name)) {
+diff --git a/src/transpiler/pineToJS/codegen.ts b/src/transpiler/pineToJS/codegen.ts
+index 7e5c0c1..46b5e08 100644
+--- a/src/transpiler/pineToJS/codegen.ts
++++ b/src/transpiler/pineToJS/codegen.ts
+@@ -922,7 +922,12 @@ export class CodeGenerator {
+             // (e.g. `Holder r = arr.get(0)` or `Holder r = map.get(key)`).
+             // Emit a bare string-literal expression statement — acorn keeps it
+             // as `ExpressionStatement(Literal)` and it is a no-op at runtime.
+-            const declaredType = decl.id?.varType;
++            // `x = array.new<MyType>()` without an annotation: the generic is
++            // the element type (`array<MyType>`), needed to dispatch user
++            // methods on `x.shift()` / `x.get(i)` / ... receivers.
++            const declaredType =
++                decl.id?.varType ||
++                (decl.init?.type === 'CallExpression' && decl.init.pineGenericType ? `array<${decl.init.pineGenericType}>` : undefined);
+             const declaredName = decl.id?.type === 'Identifier' ? decl.id.name : null;
+             if (
+                 declaredName &&
+diff --git a/src/transpiler/pineToJS/parser.ts b/src/transpiler/pineToJS/parser.ts
+index af1c993..afb6662 100644
+--- a/src/transpiler/pineToJS/parser.ts
++++ b/src/transpiler/pineToJS/parser.ts
+@@ -1289,6 +1289,20 @@ export class Parser {
+         return false;
+     }
+ 
++    /**
++     * A declaration may be followed by more statements on the same line:
++     * `var line l = na, line.delete(l)` or `[a, b] = f(), c = a + b`. The
++     * declaration parsers stop at the comma; parse the rest of the line as a
++     * sequence and return everything as one statement list.
++     */
++    continueSequence(first: any) {
++        if (!first || !this.match(TokenType.COMMA)) return first;
++        this.advance(); // consume ','
++        this.skipNewlines(true);
++        const rest = this.parseStatementOrSequence();
++        return [first, ...(Array.isArray(rest) ? rest : rest ? [rest] : [])];
++    }
++
+     // Parse statement or comma-separated sequence
+     parseStatementOrSequence() {
+         const startPos = this.pos;
+@@ -1316,12 +1330,12 @@ export class Parser {
+ 
+         // Check for var/varip declarations (can appear in function bodies)
+         if (this.match(TokenType.KEYWORD, 'var') || this.match(TokenType.KEYWORD, 'varip')) {
+-            return this.parseVarDeclaration();
++            return this.continueSequence(this.parseVarDeclaration());
+         }
+ 
+         // Tuple destructuring [a, b] = ...
+         if (this.isTupleDestructuring()) {
+-            return this.parseTupleDestructuring();
++            return this.continueSequence(this.parseTupleDestructuring());
+         }
+ 
+         // Check for typed variable declaration (series float x = ...)
+@@ -1905,7 +1919,12 @@ export class Parser {
+ 
+                 // If we successfully parsed generic and next is (, parse call
+                 if (isGeneric && this.match(TokenType.LPAREN)) {
++                    const isArrayNew = expr.type === 'MemberExpression' && expr.object?.name === 'array' && expr.property?.name === 'new';
+                     expr = this.parseCallExpression(expr);
++                    // Keep the element type of `array.new<MyType>()` so the
++                    // declaration can record `array<MyType>` (codegen drops the
++                    // generic from the emitted call).
++                    if (isArrayNew && genericType) expr.pineGenericType = genericType;
+                     continue;
+                 } else if (!isGeneric) {
+                     // Not a generic, break and let comparison operator handle it
+diff --git a/src/transpiler/settings.ts b/src/transpiler/settings.ts
+index 0b2c08f..734a8ca 100644
+--- a/src/transpiler/settings.ts
++++ b/src/transpiler/settings.ts
+@@ -169,6 +169,23 @@ export const NAMESPACE_COLLISION_NAMES = new Set([
+     'barmerge',
+     'scale',
+     'settlement_as_close',
++    // Built-in FUNCTIONS (no namespace) that scripts also use as variable
++    // names, e.g. a screener's `indicator = ""` / `[t, indicator] = ...` or
++    // `barcolor = close > open ? ... : ...` before `barcolor(barcolor)`.
++    // Unrenamed, the variable hid the built-in from the `$.pine` injection
++    // and the top-level `indicator(...)` call threw "indicator is not defined".
++    'indicator',
++    'library',
++    'plotshape',
++    'plotchar',
++    'plotarrow',
++    'plotbar',
++    'plotcandle',
++    'bgcolor',
++    'barcolor',
++    'alertcondition',
++    'fixnan',
++    'timestamp',
+ ]);
+ 
+ // JavaScript reserved words (and unsafe-to-shadow globals) that ARE valid Pine
+diff --git a/src/transpiler/slicing/buildLtfSlices.ts b/src/transpiler/slicing/buildLtfSlices.ts
+index d2c4d5d..4b94099 100644
+--- a/src/transpiler/slicing/buildLtfSlices.ts
++++ b/src/transpiler/slicing/buildLtfSlices.ts
+@@ -211,6 +211,23 @@ function findEarliestInvocationIdx(wrapperBody: any, fnName: string, fnDeclNode:
+     return -1;
+ }
+ 
++/**
++ * Index of the LAST top-level statement that invokes `fnName`, or -1.
++ * A function wrapping `request.security` is often called from several
++ * places (`f_tf("15")`, `f_tf("60")`): each call site has its own
++ * runtime expression name (`$$.id + 'pN'`), and the secondary context has
++ * to run every one of them, not just the first.
++ */
++function findLatestInvocationIdx(wrapperBody: any, fnName: string, fnDeclNode: any): number {
++    const stmts: any[] = wrapperBody.body || [];
++    for (let i = stmts.length - 1; i >= 0; i--) {
++        const stmt = stmts[i];
++        if (stmt === fnDeclNode) continue;
++        if (subtreeContainsDollarCall(stmt, fnName)) return i;
++    }
++    return -1;
++}
++
+ function subtreeContainsDollarCall(root: any, fnName: string): boolean {
+     let found = false;
+     const seen = new WeakSet<object>();
+@@ -283,9 +300,10 @@ function buildPhase3SliceStmts(wrapperBody: any, path: any[]): any[] | null {
+     const fnSlicePath = path.slice(fnIdx); // [fnDecl, fnDecl.body?, …, call]
+     const slicedFn = sliceAlongPath(fnNode, fnSlicePath, 0);
+ 
+-    // Find the earliest top-level invocation of this function.
+-    const invIdx = findEarliestInvocationIdx(wrapperBody, fnName, fnNode);
+-    if (invIdx < 0) return null;
++    // Find the top-level invocations of this function: the slice runs up to
++    // the LAST one, so every call site's expression is evaluated.
++    if (findEarliestInvocationIdx(wrapperBody, fnName, fnNode) < 0) return null;
++    const invIdx = findLatestInvocationIdx(wrapperBody, fnName, fnNode);
+ 
+     // Build the wrapper.body slice: keep [0..invIdx] inclusive, with
+     // fnNode replaced by slicedFn. The fn declaration may sit AFTER
+diff --git a/src/transpiler/transformers/ExpressionTransformer.ts b/src/transpiler/transformers/ExpressionTransformer.ts
+index 9df1251..238f591 100644
+--- a/src/transpiler/transformers/ExpressionTransformer.ts
++++ b/src/transpiler/transformers/ExpressionTransformer.ts
+@@ -2,7 +2,7 @@
+ // Copyright (C) 2026 LuxAlgo
+ 
+ import * as walk from 'acorn-walk';
+-import ScopeManager, { normalizePineBaseType } from '../analysis/ScopeManager';
++import ScopeManager, { normalizePineBaseType, pineArrayElementType } from '../analysis/ScopeManager';
+ import { ASTFactory, CONTEXT_NAME } from '../utils/ASTFactory';
+ import {
+     KNOWN_NAMESPACES,
+@@ -14,7 +14,7 @@ import {
+     FOOTPRINT_ROW_METHODS,
+ } from '../settings';
+ 
+-const UNDEFINED_ARG = {
++const UNDEFINED_ARG_NODE = {
+     type: 'Identifier',
+     name: 'undefined',
+ };
+@@ -174,6 +174,11 @@ export function transformArrayIndex(node: any, scopeManager: ScopeManager): void
+ }
+ 
+ export function addArrayAccess(node: any, scopeManager: ScopeManager): void {
++    // JS literals are never series. A walker that descends into an already
++    // transformed `ns.param(x, undefined, 'pN')` (e.g. an inline lazy-operand
++    // call inside a return expression) must not turn the index into
++    // `$.get(undefined, 0)`.
++    if (node.name === 'undefined' || node.name === 'NaN' || node.name === 'Infinity') return;
+     const memberExpr = ASTFactory.createGetCall(ASTFactory.createIdentifier(node.name), 0);
+     // Preserve location info if available
+     if (node.start !== undefined) memberExpr.start = node.start;
+@@ -419,7 +424,7 @@ export function transformMemberExpression(memberNode: any, originalParamName: st
+                 ASTFactory.createContextIdentifier(),
+                 ASTFactory.createIdentifier('param'),
+             ),
+-            arguments: [memberNode.object, UNDEFINED_ARG, makeParamNameArg(scopeManager, paramId)],
++            arguments: [memberNode.object, { ...UNDEFINED_ARG_NODE }, makeParamNameArg(scopeManager, paramId)],
+             _transformed: true,
+             _isParamCall: true,
+         };
+@@ -705,6 +710,20 @@ function transformOperand(node: any, scopeManager: ScopeManager, namespace: stri
+                 return ASTFactory.createGetCall(valueExpr, node.property);
+             }
+ 
++            // A deeper non-computed chain (`z.settings.depth`): lower the inner
++            // chain first so its base gets the same treatment as a one-level
++            // access (`z.depth` → `$.get(z, 0).depth`). Left raw, the base of a
++            // UDT function parameter stayed a Series → "Cannot read properties
++            // of undefined (reading 'depth')".
++            if (!node.computed && node.object.type === 'MemberExpression' && !node.object.computed) {
++                return {
++                    type: 'MemberExpression',
++                    object: transformOperand(node.object, scopeManager, namespace),
++                    property: node.property,
++                    computed: false,
++                };
++            }
++
+             // Handle array access
+             const transformedObject = (node.object.type === 'Identifier' && !isNamespacePropAccess)
+                 ? transformIdentifierForParam(node.object, scopeManager)
+@@ -718,7 +737,7 @@ function transformOperand(node: any, scopeManager: ScopeManager, namespace: stri
+             if (!node.computed && node.object.type === 'Identifier' && !isNamespacePropAccess) {
+                 const [scopedName] = scopeManager.getVariable(node.object.name);
+                 const isUserVariable = scopedName !== node.object.name;
+-                if (isUserVariable && !scopeManager.isLoopVariable(node.object.name)) {
++                if ((isUserVariable || scopeManager.isFunctionParam(node.object.name)) && !scopeManager.isLoopVariable(node.object.name)) {
+                     finalObject = ASTFactory.createGetCall(transformedObject, 0);
+                 }
+             }
+@@ -955,7 +974,7 @@ function getParamFromConditionalExpression(node: any, scopeManager: ScopeManager
+     const paramCall = {
+         type: 'CallExpression',
+         callee: memberExpr,
+-        arguments: [node, UNDEFINED_ARG, makeParamNameArg(scopeManager, nextParamId)],
++        arguments: [node, { ...UNDEFINED_ARG_NODE }, makeParamNameArg(scopeManager, nextParamId)],
+         _transformed: true,
+         _isParamCall: true,
+     };
+@@ -1138,13 +1157,40 @@ export function transformFunctionArgument(arg: any, namespace: string, scopeMana
+                           return id;
+                       })()
+                     : createScopedVariableReference(baseName, scopeManager);
+-                cursor.object = ASTFactory.createGetCall(baseRef, arg.property);
++                // The lookback index is emitted as-is into `$.get(base, N)`, and
++                // this argument is not walked again: scope a variable index
++                // (`b.i[ppLen]`), which otherwise leaked bare ("ppLen is not
++                // defined"). Same index handling as the generic subscript below.
++                let lookback: any = arg.property;
++                if (lookback.type === 'Identifier' && !scopeManager.isContextBound(lookback.name) && !scopeManager.isLoopVariable(lookback.name)) {
++                    lookback = ASTFactory.createGetCall(transformIdentifierForParam(lookback, scopeManager), 0);
++                } else if (['BinaryExpression', 'UnaryExpression', 'LogicalExpression', 'ConditionalExpression'].includes(lookback.type)) {
++                    lookback = transformOperand(lookback, scopeManager, namespace);
++                }
++                cursor.object = ASTFactory.createGetCall(baseRef, lookback);
+                 // `arg.object` is now the rewritten `$.get(<base>, N).field…`
+                 // chain; it replaces the whole `arg` expression. The outer
+                 // `$.param(...)` wrapper that the rest of this branch would
+                 // have applied is intentionally skipped — the lookback is
+                 // already baked into `$.get(...)`.
+-                return arg.object;
++                //
++                // Before N bars of history exist `$.get(<base>, N)` is not an
++                // instance, so the field read must be na (NaN), not a throw or
++                // `undefined` — an `undefined` first argument made `plot()`
++                // reject its whole signature (title lost, every value null).
++                // (`$.get` itself yields NaN there, so only DEEPER links of the
++                // chain need optional access; the first stays `$.get(b, N).field`.)
++                let hasOptional = false;
++                for (let m: any = arg.object; m && m.type === 'MemberExpression' && m !== cursor; m = m.object) {
++                    m.optional = true;
++                    hasOptional = true;
++                }
++                return {
++                    type: 'LogicalExpression',
++                    operator: '??',
++                    left: hasOptional ? { type: 'ChainExpression', expression: arg.object } : arg.object,
++                    right: { type: 'Identifier', name: 'NaN' },
++                };
+             }
+         }
+ 
+@@ -1283,6 +1329,20 @@ export function transformFunctionArgument(arg: any, namespace: string, scopeMana
+ 
+     if (arg.type === 'ObjectExpression') {
+         arg.properties = arg.properties.map((prop: any) => {
++            // `request.security(..., expression = close)` passed by NAME: the
++            // expression must be wrapped in `request.param(…, 'pN')` exactly
++            // like the positional form, or the secondary context never
++            // records its per-bar values under a name and the lookup reads
++            // `params[undefined][idx]` ("Cannot read properties of undefined").
++            if (
++                namespace === 'request' &&
++                !prop.computed &&
++                (prop.key?.name === 'expression' || prop.key?.value === 'expression') &&
++                !prop.value?._isParamCall
++            ) {
++                prop.value = transformFunctionArgument(prop.value, namespace, scopeManager);
++                return prop;
++            }
+             // Get the variable name and kind
+             if (prop.value.name) {
+                 // If it's a context-bound variable (like 'close', 'open'), a local series
+@@ -1346,7 +1406,7 @@ export function transformFunctionArgument(arg: any, namespace: string, scopeMana
+             const paramCall = {
+                 type: 'CallExpression',
+                 callee: memberExpr,
+-                arguments: [arg, UNDEFINED_ARG, makeParamNameArg(scopeManager, nextParamId)],
++                arguments: [arg, { ...UNDEFINED_ARG_NODE }, makeParamNameArg(scopeManager, nextParamId)],
+                 _transformed: true,
+                 _isParamCall: true,
+             };
+@@ -1377,7 +1437,7 @@ export function transformFunctionArgument(arg: any, namespace: string, scopeMana
+     const paramCall = {
+         type: 'CallExpression',
+         callee: memberExpr,
+-        arguments: [transformedArg, UNDEFINED_ARG, makeParamNameArg(scopeManager, nextParamId)],
++        arguments: [transformedArg, { ...UNDEFINED_ARG_NODE }, makeParamNameArg(scopeManager, nextParamId)],
+         _transformed: true,
+         _isParamCall: true,
+     };
+@@ -1444,6 +1504,21 @@ function resolveCalleeObject(node: any, parentNode: any, scopeManager: ScopeMana
+         node.parent = parentNode;
+         transformIdentifier(node, scopeManager);
+     } else if (node.type === 'MemberExpression') {
++        // A namespace sub-namespace as the receiver of a call —
++        // `strategy.opentrades.size(0)`, `strategy.closedtrades.entry_time(0)`.
++        // These are callable factories at runtime (`strategy.opentrades()`),
++        // and every other path auto-calls them; inside call arguments and
++        // return expressions they stayed bare → "... .size is not a function".
++        if (
++            !node.computed &&
++            node.object?.type === 'Identifier' &&
++            KNOWN_NAMESPACES.includes(node.object.name) &&
++            scopeManager.isContextBound(node.object.name)
++        ) {
++            node.parent = parentNode;
++            transformMemberExpression(node, '', scopeManager);
++            return;
++        }
+         resolveCalleeObject(node.object, node, scopeManager);
+     } else if (node.type === 'CallExpression') {
+         if (node.callee && node.callee.type === 'MemberExpression') {
+@@ -1455,6 +1530,36 @@ function resolveCalleeObject(node: any, parentNode: any, scopeManager: ScopeMana
+     }
+ }
+ 
++// Array members that return one element: `arr.shift()`, `arr.get(i)`, ...
++const ARRAY_ELEMENT_GETTERS = new Set(['get', 'first', 'last', 'shift', 'pop', 'remove']);
++
++/**
++ * Static type of an array element pulled out by a call, e.g. `gaps.shift()`,
++ * `gaps.get(0)`, `array.pop(gaps)` or `this.items.last()`, when the array's
++ * element type is known (`array.new<Gap>()`, `array<Gap>`/`Gap[]` annotations,
++ * typed params, UDT fields). Lets `gaps.shift().delete()` reach a user
++ * `method delete(Gap g)` instead of a built-in `delete`.
++ */
++function arrayElementCallType(node: any, scopeManager: ScopeManager): string | undefined {
++    if (node?.type === 'ChainExpression') node = node.expression;
++    if (node?.type !== 'CallExpression') return undefined;
++    // An already-transformed receiver is an optional chain: `$.get(arr, 0)?.shift?.()`
++    const callee = node.callee?.type === 'ChainExpression' ? node.callee.expression : node.callee;
++    if (callee?.type !== 'MemberExpression' || callee.computed) return undefined;
++    const member = callee.property?.name;
++    if (!ARRAY_ELEMENT_GETTERS.has(member)) return undefined;
++    let arrNode = callee.object;
++    // Namespace form: `array.get(arr, i)` / `array.shift(arr)`
++    if (arrNode?.type === 'Identifier' && arrNode.name === 'array') arrNode = node.arguments?.[0];
++    if (!arrNode) return undefined;
++    if (arrNode.name) return scopeManager.getVarElementType(arrNode.name);
++    if (arrNode.type === 'MemberExpression' && !arrNode.computed && arrNode.property?.type === 'Identifier' && arrNode.object?.name) {
++        const udt = scopeManager.getVariableUdtType(arrNode.object.name);
++        if (udt) return pineArrayElementType(scopeManager.getUdtTypeFields(udt)?.[arrNode.property.name]);
++    }
++    return undefined;
++}
++
+ /**
+  * True when `transformCallExpression` kept a lazy-operand call inline (see
+  * LazyOperandPass). Such a node is fully transformed — callee and arguments
+@@ -1528,6 +1633,10 @@ function transformCallExpressionInner(node: any, scopeManager: ScopeManager, nam
+         }
+ 
+         const namespace = node.callee.object.name;
++        // `array.pop(gaps)` with a known element type: the call is hoisted to
++        // a temp below, which then carries the element type (see
++        // arrayElementCallType) for a chained `.method()` dispatch.
++        const hoistedElemType = namespace === 'array' ? arrayElementCallType(node, scopeManager) : undefined;
+         // Transform arguments using the namespace's param
+         const newArgs: any[] = [];
+         node.arguments.forEach((arg: any) => {
+@@ -1649,6 +1758,7 @@ function transformCallExpressionInner(node: any, scopeManager: ScopeManager, nam
+         if (!scopeManager.shouldSuppressHoisting()) {
+             const tempVarName = scopeManager.generateTempVar();
+             scopeManager.addLocalSeriesVar(tempVarName); // Mark as local series
++            if (hoistedElemType) scopeManager.setVarStaticType(tempVarName, hoistedElemType);
+ 
+             // Check if this CallExpression was inside an await expression
+             const wasInsideAwait = node._insideAwait === true;
+@@ -1765,6 +1875,8 @@ function transformCallExpressionInner(node: any, scopeManager: ScopeManager, nam
+                 const fieldType = scopeManager.getUdtTypeFields(baseUdtType)?.[_obj.property.name];
+                 receiverBaseType = normalizePineBaseType(fieldType);
+             }
++        } else if (_obj.type === 'CallExpression' || _obj.type === 'ChainExpression') {
++            receiverBaseType = arrayElementCallType(_obj, scopeManager);
+         }
+         const methodReceiverType = scopeManager.getMethodReceiverType(methodName);
+         const receiverTypeMatches = !!receiverBaseType && !!methodReceiverType && receiverBaseType === methodReceiverType;
+@@ -1982,8 +2094,15 @@ function transformCallExpressionInner(node: any, scopeManager: ScopeManager, nam
+         // Case 2 — Chained: $.get(X, N).field.method()
+         //   callee.object is a MemberExpression (the .field access), with $.get() deeper
+         const isChained = calleeObj?.type === 'MemberExpression' && hasGetCallInChain(calleeObj);
+-
+-        if (isDirect || isChained) {
++        // Case 3 — Loop element: `for b in boxes` → `b.delete()`. The loop
++        //   variable is a raw element, and arrays of drawings routinely hold
++        //   `na` (e.g. `array.new_box(5)`, or drawings created inside a
++        //   request.security secondary context, where `box.new` returns null).
++        //   TradingView treats a method call on `na` as a no-op.
++        const isLoopElement =
++            calleeObj?.type === 'Identifier' && !calleeObj.name.startsWith('$') && scopeManager.isLoopVariable(calleeObj.name);
++
++        if (isDirect || isChained || isLoopElement) {
+             // Double optional chaining: obj?.method?.()
+             // The node stays as a CallExpression (safe for AST walkers) but gets:
+             //   1. optional: true on the CallExpression  → produces ?.()
+diff --git a/src/transpiler/transformers/MainTransformer.ts b/src/transpiler/transformers/MainTransformer.ts
+index 1cb6768..20fc5c9 100644
+--- a/src/transpiler/transformers/MainTransformer.ts
++++ b/src/transpiler/transformers/MainTransformer.ts
+@@ -2,7 +2,7 @@
+ // Copyright (C) 2026 LuxAlgo
+ 
+ import * as walk from 'acorn-walk';
+-import ScopeManager from '../analysis/ScopeManager';
++import ScopeManager, { pineArrayElementType } from '../analysis/ScopeManager';
+ import { ASTFactory } from '../utils/ASTFactory';
+ import { transformIdentifier, transformCallExpression, transformMemberExpression, addArrayAccess } from './ExpressionTransformer';
+ import {
+@@ -411,6 +411,29 @@ export function runTransformationPass(
+             }
+         },
+         ForOfStatement(node: any, state: ScopeManager, c: any) {
++            // `for g in gaps` over an array whose element type is known
++            // (`array.new<Gap>()`, `array<Gap>` annotation, typed param, UDT
++            // field): give the loop variable that static type for the body, so
++            // `g.delete()` reaches a user `method delete(Gap g)` instead of a
++            // built-in member of the same name. Restored after the loop.
++            let loopElemVar: string | undefined;
++            let loopElemPrev: string | undefined;
++            if (node.left?.type === 'VariableDeclaration' && node.right) {
++                const id = node.left.declarations[0]?.id;
++                const elemVar = id?.type === 'Identifier' ? id.name : id?.type === 'ArrayPattern' && id.elements?.[1]?.type === 'Identifier' ? id.elements[1].name : undefined;
++                let elemType: string | undefined;
++                if (node.right.type === 'Identifier') {
++                    elemType = state.getVarElementType(node.right.name);
++                } else if (node.right.type === 'MemberExpression' && !node.right.computed && node.right.object?.type === 'Identifier' && node.right.property?.type === 'Identifier') {
++                    const udt = state.getVariableUdtType(node.right.object.name);
++                    if (udt) elemType = pineArrayElementType(state.getUdtTypeFields(udt)?.[node.right.property.name]);
++                }
++                if (elemVar && elemType) {
++                    loopElemVar = elemVar;
++                    loopElemPrev = state.getVarStaticTypeRaw(elemVar);
++                    state.setVarStaticType(elemVar, elemType);
++                }
++            }
+             // Mark the left (variable declaration) to skip transformation
+             if (node.left && node.left.type === 'VariableDeclaration') {
+                 node.left._skipTransformation = true;
+@@ -484,6 +507,11 @@ export function runTransformationPass(
+                 node.body.body.unshift(forOfGuard.guardCheck);
+             }
+ 
++            if (loopElemVar) {
++                state.unsetVarStaticType(loopElemVar);
++                if (loopElemPrev !== undefined) state.setVarStaticType(loopElemVar, loopElemPrev);
++            }
++
+             // Clean up loop variables so they don't leak to outer scope
+             if (node.left && node.left.type === 'VariableDeclaration') {
+                 const decl = node.left.declarations[0];
+@@ -553,6 +581,14 @@ export function runTransformationPass(
+                 };
+                 node.arguments.forEach((arg: any) => traverseForIIFEs(arg));
+             }
++            // A field target (`candle.dow := switch …`) stays an
++            // AssignmentExpression: its switch-expression IIFE on the right
++            // needs the same traversal, or every identifier inside it leaks
++            // bare (→ "ReferenceError: candle is not defined").
++            else if (node.type === 'AssignmentExpression' && node.left?.type === 'MemberExpression' && node.right?.type === 'CallExpression' && node.right.callee &&
++                (node.right.callee.type === 'ArrowFunctionExpression' || node.right.callee.type === 'FunctionExpression')) {
++                c(node.right.callee, state);
++            }
+         },
+         FunctionDeclaration(node: any, state: ScopeManager, c: any) {
+             transformFunctionDeclaration(node, state, c);
+diff --git a/src/transpiler/transformers/StatementTransformer.ts b/src/transpiler/transformers/StatementTransformer.ts
+index cfc1576..b3da133 100644
+--- a/src/transpiler/transformers/StatementTransformer.ts
++++ b/src/transpiler/transformers/StatementTransformer.ts
+@@ -1044,6 +1044,17 @@ export function transformWhileStatement(node: any, scopeManager: ScopeManager, c
+     }
+ }
+ 
++/**
++ * True for a member chain already rewritten to a context reference
++ * (`$.var.glb1_x`, `$$.let.fn1_y`): its base is the context object itself and
++ * must never be scoped again (that would emit `$.get($$, 0).let…`).
++ */
++function isScopedContextRef(node: any): boolean {
++    let base = node;
++    while (base && base.type === 'MemberExpression') base = base.object;
++    return !!base && base.type === 'Identifier' && (base.name === CONTEXT_NAME || base.name === '$$');
++}
++
+ export function transformExpression(node: any, scopeManager: ScopeManager): void {
+     walk.recursive(node, scopeManager, {
+         MemberExpression(node: any, state: ScopeManager, c: any) {
+@@ -1057,6 +1068,14 @@ export function transformExpression(node: any, scopeManager: ScopeManager): void
+                 node.object.parent = node;
+                 c(node.object, state);
+             }
++            // A dot chain (`htf1.settings.show`) has a MemberExpression object:
++            // walk it too, so the base identifier at the bottom of the chain is
++            // scoped. Otherwise a user variable in an if-condition inside a
++            // function leaks bare → "ReferenceError: htf1 is not defined".
++            else if (node.object && node.object.type === 'MemberExpression' && !node.computed && !isScopedContextRef(node.object)) {
++                node.object.parent = node;
++                c(node.object, state);
++            }
+             transformMemberExpression(node, '', scopeManager);
+         },
+ 
+@@ -1393,8 +1412,17 @@ export function transformReturnStatement(node: any, scopeManager: ScopeManager):
+                             node._arrayAccessed = true;
+                         }
+                     },
+-                    MemberExpression(node: any) {
++                    MemberExpression(node: any, state: ScopeManager, c: any) {
+                         transformMemberExpression(node, '', scopeManager);
++                        // Recurse into non-namespace objects so a user variable at
++                        // the base of a member chain (e.g. a global UDT instance in
++                        // `return t.x + 1`) is scoped like everywhere else —
++                        // otherwise it leaks bare → "ReferenceError: t is not defined".
++                        if (node.type === 'MemberExpression' && node.object && !isScopedContextRef(node.object)) {
++                            if (node.object.type !== 'Identifier' || !scopeManager.isContextBound(node.object.name)) {
++                                c(node.object, state);
++                            }
++                        }
+                     },
+                     // When an arrow function's last statement is an assignment
+                     // (e.g. `tracker.field := …`), the parser folds it into the
+@@ -1535,8 +1563,10 @@ export function transformFunctionDeclaration(node: any, scopeManager: ScopeManag
+         node.params.forEach((param: any) => {
+             if (param.type === 'Identifier') {
+                 scopeManager.addLocalSeriesVar(param.name);
++                scopeManager.declareFunctionParam(param.name);
+             } else if (param.type === 'AssignmentPattern' && param.left?.type === 'Identifier') {
+                 scopeManager.addLocalSeriesVar(param.left.name);
++                scopeManager.declareFunctionParam(param.left.name);
+             }
+         });
+ 
+@@ -1570,7 +1600,7 @@ export function transformFunctionDeclaration(node: any, scopeManager: ScopeManag
+         const savedStaticBindings: Record<string, string | undefined> = {};
+         if (rawParamTypes) {
+             for (const [paramName, typeName] of Object.entries(rawParamTypes)) {
+-                savedStaticBindings[paramName] = scopeManager.getVarStaticType(paramName);
++                savedStaticBindings[paramName] = scopeManager.getVarStaticTypeRaw(paramName);
+                 scopeManager.setVarStaticType(paramName, typeName);
+             }
+         }
+diff --git a/tests/namespaces/request-fundamentals-na.test.ts b/tests/namespaces/request-fundamentals-na.test.ts
+new file mode 100644
+index 0000000..c15802d
+--- /dev/null
++++ b/tests/namespaces/request-fundamentals-na.test.ts
+@@ -0,0 +1,35 @@
++import { describe, it, expect } from 'vitest';
++import { PineTS } from '../../src/PineTS.class';
++import { Provider } from '@pinets/marketData/Provider.class';
++
++// Regression guard: scripts that merely REFERENCE fundamental requests — the
++// built-in VWAP's "Earnings"/"Dividends"/"Splits" anchors call
++// request.earnings / request.dividends / request.splits on every bar — failed
++// with "request.earnings is not a function". No provider serves such data, so
++// they return na, as TradingView does for symbols without it (futures, crypto).
++describe('request.earnings / dividends / splits / financial / economic / currency_rate', () => {
++    it('return na (currency_rate: 1 for the same currency) and the script runs', async () => {
++        const pineTS = new PineTS(Provider.Mock, 'BTCUSDC', 'D', null, new Date('2019-01-01').getTime(), new Date('2019-03-01').getTime());
++        const code = `
++//@version=5
++indicator("t", overlay=true)
++e = request.earnings(syminfo.tickerid, earnings.actual, barmerge.gaps_on, barmerge.lookahead_on, ignore_invalid_symbol=true)
++d = request.dividends(syminfo.tickerid, dividends.gross, barmerge.gaps_on, barmerge.lookahead_on, ignore_invalid_symbol=true)
++s = request.splits(syminfo.tickerid, splits.denominator, barmerge.gaps_on, barmerge.lookahead_on, ignore_invalid_symbol=true)
++f = request.financial(syminfo.tickerid, "TOTAL_REVENUE", "FQ", ignore_invalid_symbol=true)
++g = request.economic("US", "GDP", ignore_invalid_symbol=true)
++anchor = not na(e) or not na(d) or not na(s)
++plot(anchor ? 1 : 0, "anchor")
++plot(na(f) and na(g) ? 1 : 0, "na_fg")
++plot(request.currency_rate("USD", "USD"), "same")
++plot(request.currency_rate("EUR", "USD"), "diff")
++`;
++        const { plots } = await pineTS.run(code);
++        const vals = (k: string) => plots[k].data.map((d: any) => d.value);
++        expect(vals('anchor').length).toBeGreaterThan(10);
++        expect(vals('anchor').every((v: any) => v === 0)).toBe(true);
++        expect(vals('na_fg').every((v: any) => v === 1)).toBe(true);
++        expect(vals('same').every((v: any) => v === 1)).toBe(true);
++        expect(vals('diff').every((v: any) => !Number.isFinite(v))).toBe(true);
++    });
++});
+diff --git a/tests/namespaces/request-security-fn-callsites.test.ts b/tests/namespaces/request-security-fn-callsites.test.ts
+new file mode 100644
+index 0000000..e2b37ec
+--- /dev/null
++++ b/tests/namespaces/request-security-fn-callsites.test.ts
+@@ -0,0 +1,32 @@
++import { describe, it, expect } from 'vitest';
++import { PineTS } from '../../src/PineTS.class';
++import { Provider } from '@pinets/marketData/Provider.class';
++
++// Regression guard: a user function wrapping request.security and called from
++// SEVERAL places (`f_tf("240")`, `f_tf("D")`) gets one runtime expression name
++// per call site. The secondary-context slice stopped at the FIRST top-level
++// invocation, so later call sites were never evaluated there and the lookup
++// threw "Cannot read properties of undefined (reading '<idx>')".
++describe('request.security inside a function called from several places', () => {
++    it('every call site resolves, matching the direct call', async () => {
++        const pineTS = new PineTS(Provider.Mock, 'BTCUSDC', '60', null, new Date('2024-01-01').getTime(), new Date('2024-01-10').getTime());
++        const code = `
++//@version=5
++indicator("t")
++f_tf(_r) =>
++    request.security(syminfo.tickerid, _r, close)
++a = f_tf("240")
++b = f_tf("D")
++plot(a, "a")
++plot(b, "b")
++plot(request.security(syminfo.tickerid, "240", close), "a_ref")
++plot(request.security(syminfo.tickerid, "D", close), "b_ref")
++`;
++        const { plots } = await pineTS.run(code);
++        const vals = (k: string) => plots[k].data.map((d: any) => d.value);
++        expect(vals('a').length).toBeGreaterThan(100);
++        expect(vals('a')).toEqual(vals('a_ref'));
++        expect(vals('b')).toEqual(vals('b_ref'));
++        expect(vals('a')).not.toEqual(vals('b'));
++    });
++});
+diff --git a/tests/namespaces/request-security-named-expression.test.ts b/tests/namespaces/request-security-named-expression.test.ts
+new file mode 100644
+index 0000000..4853fba
+--- /dev/null
++++ b/tests/namespaces/request-security-named-expression.test.ts
+@@ -0,0 +1,26 @@
++import { describe, it, expect } from 'vitest';
++import { PineTS } from '../../src/PineTS.class';
++import { Provider } from '@pinets/marketData/Provider.class';
++
++// Regression guard: `request.security(symbol=…, timeframe=…, expression=close)`
++// with the expression passed BY NAME. The named value was not wrapped in
++// request.param, so the secondary context recorded no per-bar values under a
++// name and the lookup threw "Cannot read properties of undefined".
++describe('request.security with a named expression argument', () => {
++    it('matches the positional form', async () => {
++        const pineTS = new PineTS(Provider.Mock, 'BTCUSDC', '60', null, new Date('2024-01-01').getTime(), new Date('2024-01-10').getTime());
++        const code = `
++//@version=5
++indicator("t")
++n = request.security(symbol=syminfo.tickerid, timeframe="240", expression=close)
++p = request.security(syminfo.tickerid, "240", close)
++plot(n, "named")
++plot(p, "positional")
++`;
++        const { plots } = await pineTS.run(code);
++        const named = plots['named'].data.map((d: any) => d.value);
++        expect(named.length).toBeGreaterThan(100);
++        expect(named.some((v: any) => Number.isFinite(v))).toBe(true);
++        expect(named).toEqual(plots['positional'].data.map((d: any) => d.value));
++    });
++});
+diff --git a/tests/namespaces/request-security-tuple-builtins.test.ts b/tests/namespaces/request-security-tuple-builtins.test.ts
+new file mode 100644
+index 0000000..0d7fbe0
+--- /dev/null
++++ b/tests/namespaces/request-security-tuple-builtins.test.ts
+@@ -0,0 +1,27 @@
++import { describe, it, expect } from 'vitest';
++import { PineTS } from '../../src/PineTS.class';
++import { Provider } from '@pinets/marketData/Provider.class';
++
++// Regression guard: built-ins that are helper objects (`time`, `time_close`)
++// inside a request.security TUPLE — `[close, time]` — were stored as the helper
++// object itself, so the destructured value plotted as null.
++describe('request.security tuple with time built-ins', () => {
++    it('time / time_close in a tuple match the single-value form', async () => {
++        const pineTS = new PineTS(Provider.Mock, 'BTCUSDC', '60', null, new Date('2024-01-01').getTime(), new Date('2024-01-10').getTime());
++        const code = `
++//@version=5
++indicator("t")
++[c, t, tc] = request.security(syminfo.tickerid, "240", [close, time, time_close])
++plot(t, "t")
++plot(tc, "tc")
++plot(request.security(syminfo.tickerid, "240", time), "t_ref")
++plot(request.security(syminfo.tickerid, "240", time_close), "tc_ref")
++`;
++        const { plots } = await pineTS.run(code);
++        const t = plots['t'].data.map((d: any) => d.value);
++        expect(t.length).toBeGreaterThan(100);
++        expect(t.some((v: any) => Number.isFinite(v) && v > 1.7e12)).toBe(true);
++        expect(t).toEqual(plots['t_ref'].data.map((d: any) => d.value));
++        expect(plots['tc'].data.map((d: any) => d.value)).toEqual(plots['tc_ref'].data.map((d: any) => d.value));
++    });
++});
+diff --git a/tests/namespaces/strategy/trade-count-values.test.ts b/tests/namespaces/strategy/trade-count-values.test.ts
+new file mode 100644
+index 0000000..9464ee3
+--- /dev/null
++++ b/tests/namespaces/strategy/trade-count-values.test.ts
+@@ -0,0 +1,35 @@
++import { describe, it, expect } from 'vitest';
++import { PineTS, Provider } from 'index';
++
++// Regression guard: `strategy.opentrades` / `strategy.closedtrades` read as a
++// VALUE (a series int, the trade count). The runtime hybrid object (count +
++// per-trade methods) reached plot() as an object: it was taken for the named-
++// args bag, so the plot lost its title and every value was null; `== 0` was
++// always false and str.tostring() did not print the count.
++describe('strategy.opentrades / closedtrades as values', () => {
++    it('plot, ==, str.tostring and arithmetic see the count', async () => {
++        const pineTS = new PineTS(Provider.Mock, 'BTCUSDC', 'D', null, new Date('2019-01-01').getTime(), new Date('2019-04-01').getTime());
++        const code = `
++//@version=5
++strategy("t")
++if bar_index % 10 == 0
++    strategy.entry("L", strategy.long, qty = 2)
++if bar_index % 10 == 5
++    strategy.close("L")
++plot(strategy.opentrades, "open")
++plot(strategy.closedtrades, "closed")
++plot(strategy.opentrades == 0 ? 1 : 0, "flat")
++plot(strategy.position_size == 0 ? 1 : 0, "flat_ref")
++plot(str.tostring(strategy.closedtrades) == str.tostring(strategy.closedtrades + 0) ? 1 : 0, "str")
++`;
++        const { plots } = await pineTS.run(code);
++        const vals = (k: string) => plots[k].data.map((d: any) => d.value);
++        const closed = vals('closed');
++        expect(closed.length).toBeGreaterThan(50);
++        expect(closed.at(-1)).toBeGreaterThan(5);
++        expect(vals('open').every((v: any) => v === 0 || v === 1)).toBe(true);
++        expect(vals('open').some((v: any) => v === 1)).toBe(true);
++        expect(vals('flat')).toEqual(vals('flat_ref'));
++        expect(vals('str').every((v: any) => v === 1)).toBe(true);
++    });
++});
+diff --git a/tests/namespaces/ta-vwap-bare.test.ts b/tests/namespaces/ta-vwap-bare.test.ts
+new file mode 100644
+index 0000000..b7d43f2
+--- /dev/null
++++ b/tests/namespaces/ta-vwap-bare.test.ts
+@@ -0,0 +1,30 @@
++import { describe, it, expect } from 'vitest';
++import { PineTS } from '../../src/PineTS.class';
++import { Provider } from '@pinets/marketData/Provider.class';
++
++// Regression guard: the built-in VARIABLE `ta.vwap` (`src = ta.vwap`,
++// `plot(ta.vwap)`) means `ta.vwap(hlc3)`. It was lowered to `ta.vwap()` /
++// `ta.vwap('<callId>')` with no source, so every bar was NaN and scripts built
++// on it (VWAP Bollinger bands) plotted nothing.
++describe('bare ta.vwap', () => {
++    it('equals ta.vwap(hlc3) as a variable, a plot argument and an operand', async () => {
++        const pineTS = new PineTS(Provider.Mock, 'BTCUSDC', '60', null, new Date('2024-01-01').getTime(), new Date('2024-01-05').getTime());
++        const code = `
++//@version=5
++indicator("t")
++src = ta.vwap
++plot(src, "var")
++plot(ta.vwap, "arg")
++plot(ta.sma(ta.vwap, 5), "sma")
++plot(ta.vwap(hlc3), "ref")
++plot(ta.sma(ta.vwap(hlc3), 5), "sma_ref")
++`;
++        const { plots } = await pineTS.run(code);
++        const vals = (k: string) => plots[k].data.map((d: any) => d.value);
++        expect(vals('ref').length).toBeGreaterThan(50);
++        expect(vals('ref').filter((v: any) => Number.isFinite(v)).length).toBeGreaterThan(50);
++        expect(vals('var')).toEqual(vals('ref'));
++        expect(vals('arg')).toEqual(vals('ref'));
++        expect(vals('sma')).toEqual(vals('sma_ref'));
++    });
++});
+diff --git a/tests/transpiler/array-element-method-dispatch.test.ts b/tests/transpiler/array-element-method-dispatch.test.ts
+new file mode 100644
+index 0000000..f16d105
+--- /dev/null
++++ b/tests/transpiler/array-element-method-dispatch.test.ts
+@@ -0,0 +1,98 @@
++import { describe, it, expect } from 'vitest';
++import { PineTS, Provider } from 'index';
++
++// Regression guard: a user `method` whose name is also a built-in member
++// (`delete`, `get`, `size`, ...) must be dispatched when the receiver is an
++// ELEMENT of an array whose element type is known — the receiver is a call
++// result (`gaps.shift()`, `gaps.get(i)`, `array.pop(gaps)`, `bk.gaps.last()`) or
++// a `for g in gaps` loop variable. These used to fall through to the built-in
++// member and threw `....delete is not a function`.
++describe('user methods on typed array elements', () => {
++    const makePineTS = () =>
++        new PineTS(Provider.Mock, 'BTCUSDC', 'D', null, new Date('2019-01-01').getTime(), new Date('2019-03-01').getTime());
++
++    const header = `
++//@version=5
++indicator("t")
++type Gap
++    float v
++type Book
++    array<Gap> gaps
++var cnt = 0
++method delete(Gap this) =>
++    cnt += 1
++    this.v
++`;
++
++    it('call-result receivers: shift() / get() / array.pop() on array.new<UDT>()', async () => {
++        const code = header + `
++var gaps = array.new<Gap>()
++gaps.push(Gap.new(close))
++gaps.push(Gap.new(close))
++gaps.push(Gap.new(close))
++gaps.shift().delete()
++gaps.get(0).delete()
++array.pop(gaps).delete()
++plot(cnt, "cnt")
++plot(gaps.size(), "size")
++`;
++        const { plots } = await makePineTS().run(code);
++        const n = plots['cnt'].data.length;
++        expect(n).toBeGreaterThan(10);
++        expect(plots['cnt'].data.at(-1)?.value).toBe(3 * n);
++        expect(plots['size'].data.at(-1)?.value).toBe(n);
++    });
++
++    it('typed annotation, typed param and UDT field arrays', async () => {
++        const code = header + `
++var array<Gap> a = array.new<Gap>()
++var bk = Book.new(array.new<Gap>())
++a.push(Gap.new(close))
++bk.gaps.push(Gap.new(close))
++bk.gaps.push(Gap.new(close))
++f(array<Gap> arr) =>
++    arr.pop().delete()
++a.last().delete()
++bk.gaps.shift().delete()
++f(bk.gaps)
++plot(cnt, "cnt")
++`;
++        const { plots } = await makePineTS().run(code);
++        const n = plots['cnt'].data.length;
++        expect(plots['cnt'].data.at(-1)?.value).toBe(3 * n);
++    });
++
++    it('for-in loop variable over a typed array', async () => {
++        const code = header + `
++var gaps = array.new<Gap>()
++gaps.push(Gap.new(close))
++k = 0
++for g in gaps
++    g.delete()
++    k += 1
++for [i, g] in gaps
++    g.delete()
++plot(cnt, "cnt")
++plot(k, "k")
++`;
++        const { plots } = await makePineTS().run(code);
++        const n = plots['k'].data.length;
++        expect(plots['k'].data.at(-1)?.value).toBe(n);
++        // bar i deletes (i+1) gaps twice: 2 * n(n+1)/2
++        expect(plots['cnt'].data.at(-1)?.value).toBe(n * (n + 1));
++    });
++
++    it('a built-in receiver keeps the built-in member (control)', async () => {
++        const code = header + `
++var lines = array.new_line()
++lines.push(line.new(bar_index, close, bar_index + 1, close))
++if lines.size() > 2
++    lines.shift().delete()
++plot(cnt, "cnt")
++`;
++        const { plots } = await makePineTS().run(code);
++        expect(plots['cnt'].data.at(-1)?.value).toBe(0);
++        const live = plots['__lines__']?.data?.at(-1)?.value?.filter((l: any) => !l._deleted) ?? [];
++        expect(live.length).toBe(2);
++    });
++});
+diff --git a/tests/transpiler/builtin-function-name-variables.test.ts b/tests/transpiler/builtin-function-name-variables.test.ts
+new file mode 100644
+index 0000000..369bc99
+--- /dev/null
++++ b/tests/transpiler/builtin-function-name-variables.test.ts
+@@ -0,0 +1,47 @@
++import { describe, it, expect } from 'vitest';
++import { PineTS, Provider } from 'index';
++
++// Regression guard: Pine keeps functions and variables apart, so scripts name
++// variables after built-in FUNCTIONS — a screener's `indicator = ""` inside a
++// helper, or `barcolor = ...` before `barcolor(barcolor)`. The variable used to
++// hide the built-in from the `$.pine` injection: the top-level `indicator(...)`
++// threw "indicator is not defined" (or read the variable instead).
++describe('variables named like built-in functions', () => {
++    const makePineTS = () =>
++        new PineTS(Provider.Mock, 'BTCUSDC', 'D', null, new Date('2019-01-01').getTime(), new Date('2019-03-01').getTime());
++
++    it('local `indicator` variable does not hide the indicator() declaration', async () => {
++        const code = `
++//@version=5
++indicator("t", overlay=true)
++calc() =>
++    indicator = ""
++    if close > open
++        indicator := "up"
++    else
++        indicator := "dn"
++    [indicator, close]
++[ind, c] = calc()
++plot(ind == "up" ? 1 : 0, "u")
++plot(close > open ? 1 : 0, "ref")
++`;
++        const { plots } = await makePineTS().run(code);
++        const u = plots['u'].data.map((d: any) => d.value);
++        const ref = plots['ref'].data.map((d: any) => d.value);
++        expect(u.length).toBeGreaterThan(10);
++        expect(u).toEqual(ref);
++    });
++
++    it('`barcolor` and `timestamp` variables next to the built-ins', async () => {
++        const code = `
++//@version=5
++indicator("t", overlay=true)
++barcolor = close > open ? color.green : color.red
++barcolor(barcolor)
++timestamp = timestamp(2019, 1, 1)
++plot(timestamp, "ts")
++`;
++        const { plots } = await makePineTS().run(code);
++        expect(plots['ts'].data.at(-1)?.value).toBe(Date.UTC(2019, 0, 1));
++    });
++});
+diff --git a/tests/transpiler/comma-after-declaration.test.ts b/tests/transpiler/comma-after-declaration.test.ts
+new file mode 100644
+index 0000000..1b9ad37
+--- /dev/null
++++ b/tests/transpiler/comma-after-declaration.test.ts
+@@ -0,0 +1,36 @@
++import { describe, it, expect } from 'vitest';
++import { PineTS, Provider } from 'index';
++
++// Regression guard: inside a function body, a `var` declaration or a tuple
++// destructuring followed by more statements on the same line —
++// `var line l = na, line.delete(l)` (LuxAlgo SMC) — failed to parse with
++// "Unexpected token COMMA". Top-level code already accepted it.
++describe('comma-separated statements after a declaration in a function body', () => {
++    const makePineTS = () =>
++        new PineTS(Provider.Mock, 'BTCUSDC', 'D', null, new Date('2019-01-01').getTime(), new Date('2019-03-01').getTime());
++
++    it('var declaration and tuple destructuring followed by statements', async () => {
++        const code = `
++//@version=5
++indicator("t")
++g(x) =>
++    [x, x * 2]
++f() =>
++    var int c = 0, c += 1
++    [a, b] = g(c), s = a + b
++    s
++drawLevel(float level) =>
++    var line l = na, line.delete(l)
++    l := line.new(bar_index, level, bar_index + 1, level)
++    l
++drawLevel(close)
++plot(f(), "s")
++`;
++        const { plots } = await makePineTS().run(code);
++        const s = plots['s'].data.map((d: any) => d.value);
++        expect(s.length).toBeGreaterThan(10);
++        expect(s.at(-1)).toBe(3 * s.length);
++        const live = plots['__lines__']?.data?.at(-1)?.value?.filter((l: any) => !l._deleted) ?? [];
++        expect(live.length).toBe(1);
++    });
++});
+diff --git a/tests/transpiler/loop-element-na-method.test.ts b/tests/transpiler/loop-element-na-method.test.ts
+new file mode 100644
+index 0000000..0c5d247
+--- /dev/null
++++ b/tests/transpiler/loop-element-na-method.test.ts
+@@ -0,0 +1,53 @@
++import { describe, it, expect } from 'vitest';
++import { PineTS, Provider } from 'index';
++
++// Regression guard: `for b in boxes` → `b.delete()` where the element is `na`
++// (an `array.new_box(n)` slot, or a drawing created inside a request.security
++// secondary context, where `box.new` returns null). TradingView treats a method
++// call on `na` as a no-op; the emitted `b.delete()` used to throw
++// "Cannot read properties of null (reading 'delete')".
++describe('method calls on na loop elements', () => {
++    const makePineTS = () =>
++        new PineTS(Provider.Mock, 'BTCUSDC', 'D', null, new Date('2019-01-01').getTime(), new Date('2019-03-01').getTime());
++
++    it('b.delete() on na elements is a no-op', async () => {
++        const code = `
++//@version=5
++indicator("t")
++var boxes = array.new_box(3)
++cnt = 0
++for b in boxes
++    b.delete()
++    cnt += 1
++plot(cnt, "cnt")
++`;
++        const { plots } = await makePineTS().run(code);
++        expect(plots['cnt'].data.length).toBeGreaterThan(10);
++        expect(plots['cnt'].data.at(-1)?.value).toBe(3);
++    });
++
++    it('drawings built in a request.security expression can be iterated and deleted', async () => {
++        const code = `
++//@version=5
++indicator("t")
++type Holder
++    array<box> boxes
++method clear(Holder h) =>
++    for b in h.boxes
++        b.delete()
++    h.boxes.size()
++calc() =>
++    var h = Holder.new(array.new_box())
++    h.boxes.push(box.new(bar_index, high, bar_index + 1, low))
++    if h.boxes.size() > 2
++        h.clear()
++        h.boxes.clear()
++    close
++v = request.security(syminfo.tickerid, "W", calc())
++plot(v, "v")
++`;
++        const { plots } = await makePineTS().run(code);
++        expect(plots['v'].data.length).toBeGreaterThan(10);
++        expect(Number.isFinite(plots['v'].data.at(-1)?.value)).toBe(true);
++    });
++});
+diff --git a/tests/transpiler/nested-param-member-chain.test.ts b/tests/transpiler/nested-param-member-chain.test.ts
+new file mode 100644
+index 0000000..f9478f9
+--- /dev/null
++++ b/tests/transpiler/nested-param-member-chain.test.ts
+@@ -0,0 +1,34 @@
++import { describe, it, expect } from 'vitest';
++import { PineTS, Provider } from 'index';
++
++// Regression guard: a two-level field chain on a UDT function parameter inside
++// an operand of a namespace-call argument — `math.floor(this.settings.depth / 2)`
++// (LuxAlgo SMC zigzag) — left the parameter as its Series, so the chain read
++// `undefined.depth` and threw. One-level chains (`s.depth / 2`) already worked.
++describe('nested member chains on function parameters in operands', () => {
++    const makePineTS = () =>
++        new PineTS(Provider.Mock, 'BTCUSDC', 'D', null, new Date('2019-01-01').getTime(), new Date('2019-03-01').getTime());
++
++    it('method receiver and plain param', async () => {
++        const code = `
++//@version=5
++indicator("t")
++type Settings
++    int depth = 10
++type ZigZag
++    Settings settings
++method upd(series ZigZag this) =>
++    int depth = math.max(2, math.floor(this.settings.depth / 2))
++    depth
++f(ZigZag z) =>
++    math.floor(z.settings.depth / 4) + math.max(z.settings.depth, 1)
++var zz = ZigZag.new(Settings.new())
++plot(zz.upd(), "d")
++plot(f(zz), "e")
++`;
++        const { plots } = await makePineTS().run(code);
++        expect(plots['d'].data.length).toBeGreaterThan(10);
++        expect(plots['d'].data.at(-1)?.value).toBe(5);
++        expect(plots['e'].data.at(-1)?.value).toBe(12);
++    });
++});
+diff --git a/tests/transpiler/param-shadows-global.test.ts b/tests/transpiler/param-shadows-global.test.ts
+new file mode 100644
+index 0000000..2ad201e
+--- /dev/null
++++ b/tests/transpiler/param-shadows-global.test.ts
+@@ -0,0 +1,44 @@
++import { describe, it, expect } from 'vitest';
++import { PineTS, Provider } from 'index';
++
++// Regression guard: a function parameter that has the same name as a global
++// (here the UDT type `kz`, a common Pine idiom: `manage(kz kz)`) must shadow it
++// inside the body. A member chain on the parameter passed to a namespace call
++// (`array.unshift(kz.store, x)`) used to resolve its base to the global type
++// (`$.const.glb1_kz`), so `array.unshift` got `undefined` and threw.
++describe('function parameter shadowing a global of the same name', () => {
++    const makePineTS = () =>
++        new PineTS(Provider.Mock, 'BTCUSDC', 'D', null, new Date('2019-01-01').getTime(), new Date('2019-03-01').getTime());
++
++    it('namespace call on a field of the shadowing param uses the param', async () => {
++        const code = `
++//@version=5
++indicator("t")
++type kz
++    string title
++    float[] store
++var a = kz.new("x", array.new_float())
++f(kz kz) =>
++    array.unshift(kz.store, close)
++    array.size(kz.store)
++plot(f(a), "n")
++`;
++        const { plots } = await makePineTS().run(code);
++        const n = plots['n'].data;
++        expect(n.length).toBeGreaterThan(10);
++        expect(n.at(-1)?.value).toBe(n.length);
++    });
++
++    it('a shadowing param that is a plain value also resolves to the param', async () => {
++        const code = `
++//@version=5
++indicator("t")
++len = 3
++f(int len) =>
++    math.max(len, 0) + array.size(array.new_float(len))
++plot(f(5), "v")
++`;
++        const { plots } = await makePineTS().run(code);
++        expect(plots['v'].data.at(-1)?.value).toBe(10);
++    });
++});
+diff --git a/tests/transpiler/strategy-trades-in-args.test.ts b/tests/transpiler/strategy-trades-in-args.test.ts
+new file mode 100644
+index 0000000..f9538fb
+--- /dev/null
++++ b/tests/transpiler/strategy-trades-in-args.test.ts
+@@ -0,0 +1,39 @@
++import { describe, it, expect } from 'vitest';
++import { PineTS, Provider } from 'index';
++
++// Regression guard: `strategy.opentrades.size(0)` / `strategy.closedtrades.entry_time(0)`
++// used as a call ARGUMENT (`plot(...)`, `math.abs(...)`), inside a binary operand,
++// or as a function's return value stayed `strategy.opentrades.size(0)` instead of
++// being lowered to the callable sub-namespace `strategy.opentrades().size(0)`,
++// so the script threw "strategy.opentrades.size is not a function".
++describe('strategy.opentrades / closedtrades members in call arguments and returns', () => {
++    const makePineTS = () =>
++        new PineTS(Provider.Mock, 'BTCUSDC', 'D', null, new Date('2019-01-01').getTime(), new Date('2019-04-01').getTime());
++
++    it('matches the same expressions read through variables', async () => {
++        const code = `
++//@version=5
++strategy("t")
++if bar_index % 10 == 0
++    strategy.entry("L", strategy.long, qty = 2)
++if bar_index % 10 == 5
++    strategy.close("L")
++lastEntry() =>
++    strategy.closedtrades.entry_time(strategy.closedtrades - 1)
++sz = strategy.opentrades.size(0)
++plot(strategy.opentrades.size(0), "size_arg")
++plot(sz, "size_var")
++plot(math.abs(strategy.opentrades.size(0)) + 0, "abs")
++plot(lastEntry(), "entry_fn")
++plot(strategy.closedtrades > 0 ? strategy.closedtrades.entry_time(strategy.closedtrades - 1) : na, "entry_ref")
++`;
++        const { plots } = await makePineTS().run(code);
++        const vals = (k: string) => plots[k].data.map((d: any) => d.value);
++        expect(vals('size_arg').length).toBeGreaterThan(30);
++        expect(vals('size_arg')).toEqual(vals('size_var'));
++        expect(vals('size_var').filter((v: any) => v === 2).length).toBeGreaterThan(5);
++        expect(vals('abs').filter((v: any) => v === 2).length).toBeGreaterThan(5);
++        expect(vals('entry_fn')).toEqual(vals('entry_ref'));
++        expect(vals('entry_fn').some((v: any) => Number.isFinite(v) && v > 1.5e12)).toBe(true);
++    });
++});
+diff --git a/tests/transpiler/udt-field-history-args.test.ts b/tests/transpiler/udt-field-history-args.test.ts
+new file mode 100644
+index 0000000..1793995
+--- /dev/null
++++ b/tests/transpiler/udt-field-history-args.test.ts
+@@ -0,0 +1,36 @@
++import { describe, it, expect } from 'vitest';
++import { PineTS, Provider } from 'index';
++
++// Regression guard: a UDT field read with history, `b.i[len]`, passed as a
++// call argument. (1) A variable lookback index leaked bare into the emitted
++// `$.get(b, len)` ("len is not defined"). (2) Before `len` bars of history the
++// read gave `undefined` instead of na, and `plot()` then rejected its whole
++// signature: the title was lost and every value plotted as null.
++describe('UDT field history reads in call arguments', () => {
++    const makePineTS = () =>
++        new PineTS(Provider.Mock, 'BTCUSDC', 'D', null, new Date('2019-01-01').getTime(), new Date('2019-03-01').getTime());
++
++    it('variable and expression lookbacks, na before enough history', async () => {
++        const code = `
++//@version=5
++indicator("t", overlay=true)
++type bar
++    float h = high
++    int   i = bar_index
++bar b = bar.new()
++len = input.int(3)
++k = 2
++plot(b.i[len], "v")
++plot(math.max(b.i[len], b.i[k * 2]), "w")
++plot(b.i[3], "lit")
++`;
++        const { plots } = await makePineTS().run(code);
++        const v = plots['v'].data.map((d: any) => d.value);
++        expect(v.length).toBeGreaterThan(10);
++        // na (NaN or null once serialized) before 3 bars of history, then bar_index - 3
++        expect(Number.isFinite(v[0])).toBe(false);
++        expect(v.at(-1)).toBe(v.length - 1 - 3);
++        expect(plots['w'].data.at(-1)?.value).toBe(v.length - 1 - 3);
++        expect(plots['lit'].data.map((d: any) => d.value)).toEqual(v);
++    });
++});
+diff --git a/tests/transpiler/undefined-index-arg.test.ts b/tests/transpiler/undefined-index-arg.test.ts
+new file mode 100644
+index 0000000..fa56841
+--- /dev/null
++++ b/tests/transpiler/undefined-index-arg.test.ts
+@@ -0,0 +1,29 @@
++import { describe, it, expect } from 'vitest';
++import { transpile } from '../../src/transpiler/index';
++
++// Regression guard: every `ns.param(value, undefined, 'pN')` shared ONE AST node
++// for its `undefined` index. A walker that descends into an inline lazy-operand
++// call in a return expression (`cond ? this.hit(x) : false`) rewrote that node
++// in place to `$.get(undefined, 0)`, and the rewrite then appeared in every
++// param call emitted afterwards (`$.get($.get($.get(undefined, 0), 0), 0)`).
++describe('param index stays a plain undefined', () => {
++    it('no $.get(undefined, ...) in the emitted code', () => {
++        const code = `
++//@version=5
++indicator("t")
++type P
++    float v
++method hit(P this, bool hi, float x) =>
++    hi ? x > this.v : x < this.v
++method find(P this, float src, bool hi, bool reg = true) =>
++    float pt = src * 1.0
++    not na(pt) and reg ? this.hit(hi, pt) : false
++var p = P.new(20000)
++plot(p.find(close, true) ? 1 : 0, "a")
++plot(math.max(close, 3), "b")
++`;
++        const js = String(transpile(code));
++        expect(js).toContain(', undefined, ');
++        expect(js).not.toContain('$.get(undefined');
++    });
++});
