@@ -1,3 +1,19 @@
+diff --git a/src/Context.class.ts b/src/Context.class.ts
+index 453cc59..45f7bed 100644
+--- a/src/Context.class.ts
++++ b/src/Context.class.ts
+@@ -772,6 +772,11 @@ export class Context {
+             return source;
+         }
+ 
++        // `strategy.opentrades` / `strategy.closedtrades` (a trade count with
++        // per-trade methods attached) recorded as a VALUE, so `[N]` can look back.
++        if (source != null && typeof source === 'object' && typeof source[Symbol.toPrimitive] === 'function') {
++            source = source[Symbol.toPrimitive]('number');
++        }
+         if (!Array.isArray(source) && typeof source === 'object') return source;
+ 
+         if (!this.params[name]) this.params[name] = [];
 diff --git a/src/Series.ts b/src/Series.ts
 index 91d8ce1..0aab542 100644
 --- a/src/Series.ts
@@ -49,10 +65,55 @@ index 4d37162..f878e24 100644
  
          return String(value);
 diff --git a/src/namespaces/Time.ts b/src/namespaces/Time.ts
-index 07e5f6f..3e536b1 100644
+index 07e5f6f..289e159 100644
 --- a/src/namespaces/Time.ts
 +++ b/src/namespaces/Time.ts
-@@ -263,6 +263,13 @@ export class TimeHelper {
+@@ -88,6 +88,44 @@ interface DateParts {
+     dayOfWeek: number; // JS convention: 0=Sun, 1=Mon, ..., 6=Sat
+ }
+ 
++/**
++ * Trading date (exchange timezone) a bar opening at `time` belongs to.
++ * TradingView's daily boundary (`timeframe.change("1D")`, the default
++ * `ta.vwap` anchor, daily bars) is the TRADING day, not the calendar day: an
++ * overnight session such as CME's `1700-1600` (America/Chicago) opens the
++ * next day's trading at 17:00, so bars from the session open to midnight
++ * belong to the NEXT date. Same-day sessions (`0930-1600`, `24x7`) and
++ * session strings that do not parse keep the calendar date.
++ */
++export function tradingDate(time: number, session: any, timezone: string): { year: number; month: number; day: number } {
++    const parts = getDatePartsInTimezone(time, timezone || 'UTC');
++    const spec = typeof session === 'string' ? parseSessionSpec(session) : null;
++    if (spec) {
++        const minutes = parts.hour * 60 + parts.minute;
++        if (spec.windows.some((w) => w.start >= w.end && minutes >= w.start)) {
++            const next = new Date(Date.UTC(parts.year, parts.month - 1, parts.day + 1));
++            return { year: next.getUTCFullYear(), month: next.getUTCMonth() + 1, day: next.getUTCDate() };
++        }
++    }
++    return { year: parts.year, month: parts.month, day: parts.day };
++}
++
++/**
++ * Key of the trading day / week / month a bar belongs to (see tradingDate).
++ * Weeks start on Monday's trading day (Sunday 17:00 for CME futures).
++ */
++export function tradingPeriodKey(time: number, unit: 'D' | 'W' | 'M', session: any, timezone: string): string {
++    const { year, month, day } = tradingDate(time, session, timezone);
++    if (unit === 'M') return `${year}-${month}`;
++    if (unit === 'W') {
++        const d = new Date(Date.UTC(year, month - 1, day));
++        const dow = d.getUTCDay();
++        d.setUTCDate(d.getUTCDate() - (dow === 0 ? 6 : dow - 1));
++        return `W${d.getUTCFullYear()}-${d.getUTCMonth() + 1}-${d.getUTCDate()}`;
++    }
++    return `${year}-${month}-${day}`;
++}
++
+ /**
+  * Decompose a UTC-millisecond timestamp into calendar parts
+  * interpreted in the given timezone.
+@@ -263,6 +301,13 @@ export class TimeHelper {
              htfBarTime = alignToTimeframe(currentTime, normalizedTF);
          }
  
@@ -66,6 +127,37 @@ index 07e5f6f..3e536b1 100644
          // Session filtering
          if (parsed.session !== undefined && parsed.session !== '') {
              const timezone = parsed.timezone || this.context.pine?.syminfo?.timezone || 'UTC';
+diff --git a/src/namespaces/Timeframe.ts b/src/namespaces/Timeframe.ts
+index 80487ef..90b5edc 100644
+--- a/src/namespaces/Timeframe.ts
++++ b/src/namespaces/Timeframe.ts
+@@ -1,5 +1,5 @@
+ import { Series } from '../Series';
+-import { alignToTimeframe, normalizeTimeframe as normalizeTFFromTime } from './Time';
++import { alignToTimeframe, normalizeTimeframe as normalizeTFFromTime, tradingPeriodKey } from './Time';
+ const TF_UNITS = ['S', 'D', 'W', 'M'];
+ 
+ /**
+@@ -120,6 +120,19 @@ export class Timeframe {
+ 
+         if (isNaN(currentTime) || isNaN(prevTime)) return false;
+ 
++        // "D" / "W" / "M": TradingView changes period at the TRADING day
++        // boundary in the exchange timezone (17:00 CT for CME futures), not at
++        // 00:00 UTC.
++        if (normalizedTarget === 'D' || normalizedTarget === 'W' || normalizedTarget === 'M') {
++            const syminfo = this.context.pine?.syminfo;
++            const session = syminfo?.session;
++            const timezone = syminfo?.timezone || 'UTC';
++            return (
++                tradingPeriodKey(currentTime, normalizedTarget, session, timezone) !==
++                tradingPeriodKey(prevTime, normalizedTarget, session, timezone)
++            );
++        }
++
+         const currentAligned = alignToTimeframe(currentTime, normalizedTarget);
+         const prevAligned = alignToTimeframe(prevTime, normalizedTarget);
+ 
 diff --git a/src/namespaces/request/methods/currency_rate.ts b/src/namespaces/request/methods/currency_rate.ts
 new file mode 100644
 index 0000000..180c87f
@@ -276,24 +368,157 @@ index 0321c00..5da5e35 100644
    constructor(private context: any) {
      // Install methods
 diff --git a/src/namespaces/ta/methods/vwap.ts b/src/namespaces/ta/methods/vwap.ts
-index f2415c4..fca111c 100644
+index f2415c4..8f058c4 100644
 --- a/src/namespaces/ta/methods/vwap.ts
 +++ b/src/namespaces/ta/methods/vwap.ts
-@@ -18,6 +18,14 @@ import { getDatePartsInTimezone } from '../../Time';
+@@ -1,92 +1,87 @@
+ // SPDX-License-Identifier: AGPL-3.0-only
+ 
+ import { Series } from '../../../Series';
+-import { getDatePartsInTimezone } from '../../Time';
++import { tradingPeriodKey } from '../../Time';
+ 
+ /**
+  * VWAP - Volume Weighted Average Price
+  *
+- * VWAP calculates the average price weighted by volume for a trading session.
+- * It resets at the start of each new session (typically daily).
++ *   ta.vwap                              built-in variable = ta.vwap(hlc3)
++ *   ta.vwap(source)                      resets at each new trading day
++ *   ta.vwap(source, anchor)              resets on bars where `anchor` is true
++ *   ta.vwap(source, anchor, stdev_mult)  → [vwap, upper band, lower band]
+  *
+- * Formula: VWAP = Σ(Price × Volume) / Σ(Volume)
+- *
+- * @param source - The price source (typically close, hlc3, or ohlc4)
+- *
+- * Note: This implementation resets VWAP at the start of each trading session
+- * based on detecting new trading days (when openTime changes to a new day).
++ * VWAP = Σ(source × volume) / Σ(volume) since the last reset; the bands are
++ * vwap ± stdev_mult × the volume-weighted standard deviation of source.
++ * The transpiler appends a `_taN` call id as the LAST argument (a bare
++ * `ta.vwap` is lowered to `ta.vwap('_taN')`).
   */
  export function vwap(context: any) {
-     return (source: any, _callId?: string) => {
-+        // Bare `ta.vwap` (the built-in variable, e.g. `src = ta.vwap`) is
-+        // lowered to `ta.vwap()` — or `ta.vwap('<callId>')` when hoisted — and
-+        // means `ta.vwap(hlc3)`. Without a source every bar was NaN.
-+        if (_callId === undefined && typeof source === 'string' && /_ta\d+$/.test(source)) {
-+            _callId = source;
-+            source = undefined;
+-    return (source: any, _callId?: string) => {
+-        // VWAP calculation using cumulative sums
++    return (...args: any[]) => {
++        let _callId: string | undefined;
++        const last = args[args.length - 1];
++        if (typeof last === 'string' && /_ta\d+$/.test(last)) {
++            _callId = last;
++            args = args.slice(0, -1);
 +        }
++        let [source, anchor, stdevMult] = args;
 +        if (source === undefined) source = context.data.hlc3;
-         // VWAP calculation using cumulative sums
++        const withBands = stdevMult !== undefined;
++
          if (!context.taState) context.taState = {};
          const stateKey = _callId || `vwap`;
+ 
+         if (!context.taState[stateKey]) {
+             context.taState[stateKey] = {
+                 lastIdx: -1,
+-                // Committed state
+-                prevCumulativePV: 0, // Cumulative price * volume
+-                prevCumulativeVolume: 0, // Cumulative volume
+-                prevLastSessionDate: null, // Track last session date
+-                // Tentative state
+-                currentCumulativePV: 0,
+-                currentCumulativeVolume: 0,
+-                currentLastSessionDate: null,
++                // Committed state (previous bar)
++                prev: { pv: 0, v: 0, pv2: 0, day: null as string | null },
++                // Tentative state (current bar; recomputed on intrabar re-runs)
++                cur: { pv: 0, v: 0, pv2: 0, day: null as string | null },
+             };
+         }
+-
+         const state = context.taState[stateKey];
+ 
+         // Commit logic
+         if (context.idx > state.lastIdx) {
+-            if (state.lastIdx >= 0) {
+-                state.prevCumulativePV = state.currentCumulativePV;
+-                state.prevCumulativeVolume = state.currentCumulativeVolume;
+-                state.prevLastSessionDate = state.currentLastSessionDate;
+-            }
++            if (state.lastIdx >= 0) state.prev = { ...state.cur };
+             state.lastIdx = context.idx;
+         }
+ 
+-        // Get current values
+-        const currentPrice = Series.from(source).get(0);
+-        const currentVolume = Series.from(context.data.volume).get(0);
+-
+-        // Get current bar's open time to detect session changes
+-        const currentOpenTime = Series.from(context.data.openTime).get(0);
++        const price = Series.from(source).get(0);
++        const volume = Series.from(context.data.volume).get(0);
++        const openTime = Series.from(context.data.openTime).get(0);
+ 
+-        // Detect new session (new trading day) using exchange timezone
+-        const timezone = context.pine?.syminfo?.timezone || 'UTC';
+-        const parts = getDatePartsInTimezone(currentOpenTime, timezone);
+-        const currentSessionDate = `${parts.year}-${String(parts.month).padStart(2, '0')}-${String(parts.day).padStart(2, '0')}`;
+-
+-        // Use committed state
+-        let cumulativePV = state.prevCumulativePV;
+-        let cumulativeVolume = state.prevCumulativeVolume;
+-        let lastSessionDate = state.prevLastSessionDate;
+-
+-        // Reset VWAP at the start of a new session
+-        if (lastSessionDate !== currentSessionDate) {
+-            cumulativePV = 0;
+-            cumulativeVolume = 0;
+-            lastSessionDate = currentSessionDate;
++        let { pv, v, pv2, day } = state.prev;
++        let reset: boolean;
++        if (anchor === undefined) {
++            const syminfo = context.pine?.syminfo;
++            // Default anchor: a new TRADING day (17:00 CT for CME futures).
++            const key = tradingPeriodKey(openTime, 'D', syminfo?.session, syminfo?.timezone || 'UTC');
++            reset = key !== day;
++            day = key;
++        } else {
++            const a = Series.from(anchor).get(0);
++            reset = day === null || a === true || (typeof a === 'number' && a !== 0 && !isNaN(a));
++            day = 'anchored';
++        }
++        if (reset) {
++            pv = 0;
++            v = 0;
++            pv2 = 0;
+         }
+ 
+-        // Update cumulative values
+-        cumulativePV += currentPrice * currentVolume;
+-        cumulativeVolume += currentVolume;
+-
+-        // Store tentative state
+-        state.currentCumulativePV = cumulativePV;
+-        state.currentCumulativeVolume = cumulativeVolume;
+-        state.currentLastSessionDate = lastSessionDate;
++        pv += price * volume;
++        v += volume;
++        pv2 += volume * price * price;
++        state.cur = { pv, v, pv2, day };
+ 
+-        // Calculate VWAP
+-        if (cumulativeVolume === 0) {
+-            return NaN;
+-        }
++        const value = v === 0 ? NaN : pv / v;
++        if (!withBands) return context.precision(value);
+ 
+-        const vwap = cumulativePV / cumulativeVolume;
+-        return context.precision(vwap);
++        const mult = Series.from(stdevMult).get(0);
++        const variance = v === 0 ? NaN : Math.max(0, pv2 / v - value * value);
++        const dev = mult * Math.sqrt(variance);
++        return [[context.precision(value), context.precision(value + dev), context.precision(value - dev)]];
+     };
+ }
 diff --git a/src/namespaces/utils.ts b/src/namespaces/utils.ts
 index 037b829..24813cf 100644
 --- a/src/namespaces/utils.ts
@@ -555,7 +780,7 @@ index d2c4d5d..4b94099 100644
      // Build the wrapper.body slice: keep [0..invIdx] inclusive, with
      // fnNode replaced by slicedFn. The fn declaration may sit AFTER
 diff --git a/src/transpiler/transformers/ExpressionTransformer.ts b/src/transpiler/transformers/ExpressionTransformer.ts
-index 9df1251..238f591 100644
+index 9df1251..77a80d6 100644
 --- a/src/transpiler/transformers/ExpressionTransformer.ts
 +++ b/src/transpiler/transformers/ExpressionTransformer.ts
 @@ -2,7 +2,7 @@
@@ -588,7 +813,45 @@ index 9df1251..238f591 100644
      const memberExpr = ASTFactory.createGetCall(ASTFactory.createIdentifier(node.name), 0);
      // Preserve location info if available
      if (node.start !== undefined) memberExpr.start = node.start;
-@@ -419,7 +424,7 @@ export function transformMemberExpression(memberNode: any, originalParamName: st
+@@ -389,12 +394,37 @@ export function transformIdentifier(node: any, scopeManager: ScopeManager): void
+     }
+ }
+ 
++/** `ns.member` (non-computed) on a context-bound KNOWN namespace: `strategy.closedtrades`, `ta.tr`. */
++function isNamespaceVariableAccess(node: any, scopeManager: ScopeManager): boolean {
++    return (
++        node?.type === 'MemberExpression' &&
++        !node.computed &&
++        node.object?.type === 'Identifier' &&
++        node.property?.type === 'Identifier' &&
++        KNOWN_NAMESPACES.includes(node.object.name) &&
++        scopeManager.isContextBound(node.object.name)
++    );
++}
++
+ export function transformMemberExpression(memberNode: any, originalParamName: string, scopeManager: ScopeManager): void {
+     // Skip transformation for Math object properties
+     if (memberNode.object && memberNode.object.type === 'Identifier' && memberNode.object.name === 'Math') {
+         return;
+     }
+ 
++    // `strategy.closedtrades[1]`, `strategy.position_size[1]`, `ta.tr[1]`: history
++    // of a namespace built-in VARIABLE. Those are callable at runtime
++    // (`strategy.closedtrades()`), so lower the object to that call and let the
++    // call-result history branch below record it per bar. Left as is, the
++    // auto-call happened after this point and `strategy.closedtrades()[1]`
++    // indexed the current value (→ undefined / the current count).
++    if (memberNode.computed && isNamespaceVariableAccess(memberNode.object, scopeManager)) {
++        const callee: any = { type: 'MemberExpression', object: memberNode.object.object, property: memberNode.object.property, computed: false };
++        const call: any = { type: 'CallExpression', callee, arguments: [], _transformed: true };
++        callee.parent = call; // already called: later walkers must not auto-call it again
++        memberNode.object = call;
++    }
++
+     // Pine history-reference operator `[]` on a CALL result, e.g.
+     // `ta.sma(close, 3)[1]` (any function call, not only ta.*). A call returns
+     // a scalar each bar, so `[N]` here is never a tuple/array index — in Pine
+@@ -419,7 +449,7 @@ export function transformMemberExpression(memberNode: any, originalParamName: st
                  ASTFactory.createContextIdentifier(),
                  ASTFactory.createIdentifier('param'),
              ),
@@ -597,7 +860,7 @@ index 9df1251..238f591 100644
              _transformed: true,
              _isParamCall: true,
          };
-@@ -705,6 +710,20 @@ function transformOperand(node: any, scopeManager: ScopeManager, namespace: stri
+@@ -705,6 +735,20 @@ function transformOperand(node: any, scopeManager: ScopeManager, namespace: stri
                  return ASTFactory.createGetCall(valueExpr, node.property);
              }
  
@@ -618,7 +881,7 @@ index 9df1251..238f591 100644
              // Handle array access
              const transformedObject = (node.object.type === 'Identifier' && !isNamespacePropAccess)
                  ? transformIdentifierForParam(node.object, scopeManager)
-@@ -718,7 +737,7 @@ function transformOperand(node: any, scopeManager: ScopeManager, namespace: stri
+@@ -718,7 +762,7 @@ function transformOperand(node: any, scopeManager: ScopeManager, namespace: stri
              if (!node.computed && node.object.type === 'Identifier' && !isNamespacePropAccess) {
                  const [scopedName] = scopeManager.getVariable(node.object.name);
                  const isUserVariable = scopedName !== node.object.name;
@@ -627,7 +890,7 @@ index 9df1251..238f591 100644
                      finalObject = ASTFactory.createGetCall(transformedObject, 0);
                  }
              }
-@@ -955,7 +974,7 @@ function getParamFromConditionalExpression(node: any, scopeManager: ScopeManager
+@@ -955,7 +999,7 @@ function getParamFromConditionalExpression(node: any, scopeManager: ScopeManager
      const paramCall = {
          type: 'CallExpression',
          callee: memberExpr,
@@ -636,7 +899,7 @@ index 9df1251..238f591 100644
          _transformed: true,
          _isParamCall: true,
      };
-@@ -1138,13 +1157,40 @@ export function transformFunctionArgument(arg: any, namespace: string, scopeMana
+@@ -1138,16 +1182,64 @@ export function transformFunctionArgument(arg: any, namespace: string, scopeMana
                            return id;
                        })()
                      : createScopedVariableReference(baseName, scopeManager);
@@ -679,7 +942,31 @@ index 9df1251..238f591 100644
              }
          }
  
-@@ -1283,6 +1329,20 @@ export function transformFunctionArgument(arg: any, namespace: string, scopeMana
++        // History of a call result or of a namespace built-in variable used as
++        // an ARGUMENT: `plot(ta.sma(close, 3)[1])`, `plot(strategy.closedtrades[1])`.
++        // `ns.param(<scalar>, N)` cannot look back (the scalar has no history),
++        // so record the value per bar like the expression path does and pass
++        // the looked-back scalar: `$.get($.param(<call>, undefined, pN), N)`.
++        // (`$.param`, `ta.param` and `math.param` keep their own per-name
++        // history, so a call result passed to those keeps the existing shape.)
++        const paramKeepsHistory = namespace === CONTEXT_NAME || namespace === 'ta' || namespace === 'math';
++        if (
++            (arg.object.type === 'CallExpression' && !paramKeepsHistory) ||
++            isNamespaceVariableAccess(arg.object, scopeManager)
++        ) {
++            if (arg.property.type === 'Identifier' && !scopeManager.isContextBound(arg.property.name) && !scopeManager.isLoopVariable(arg.property.name)) {
++                arg.property = ASTFactory.createGetCall(transformIdentifierForParam(arg.property, scopeManager), 0);
++            } else if (['BinaryExpression', 'UnaryExpression', 'LogicalExpression', 'ConditionalExpression'].includes(arg.property.type)) {
++                arg.property = transformOperand(arg.property, scopeManager, namespace);
++            }
++            transformMemberExpression(arg, '', scopeManager);
++            return arg;
++        }
++
+         // Ensure complex objects are transformed before being used as array source
+         if (arg.object.type === 'CallExpression') {
+             transformCallExpression(arg.object, scopeManager);
+@@ -1283,6 +1375,20 @@ export function transformFunctionArgument(arg: any, namespace: string, scopeMana
  
      if (arg.type === 'ObjectExpression') {
          arg.properties = arg.properties.map((prop: any) => {
@@ -700,7 +987,7 @@ index 9df1251..238f591 100644
              // Get the variable name and kind
              if (prop.value.name) {
                  // If it's a context-bound variable (like 'close', 'open'), a local series
-@@ -1346,7 +1406,7 @@ export function transformFunctionArgument(arg: any, namespace: string, scopeMana
+@@ -1346,7 +1452,7 @@ export function transformFunctionArgument(arg: any, namespace: string, scopeMana
              const paramCall = {
                  type: 'CallExpression',
                  callee: memberExpr,
@@ -709,7 +996,7 @@ index 9df1251..238f591 100644
                  _transformed: true,
                  _isParamCall: true,
              };
-@@ -1377,7 +1437,7 @@ export function transformFunctionArgument(arg: any, namespace: string, scopeMana
+@@ -1377,7 +1483,7 @@ export function transformFunctionArgument(arg: any, namespace: string, scopeMana
      const paramCall = {
          type: 'CallExpression',
          callee: memberExpr,
@@ -718,7 +1005,7 @@ index 9df1251..238f591 100644
          _transformed: true,
          _isParamCall: true,
      };
-@@ -1444,6 +1504,21 @@ function resolveCalleeObject(node: any, parentNode: any, scopeManager: ScopeMana
+@@ -1444,6 +1550,21 @@ function resolveCalleeObject(node: any, parentNode: any, scopeManager: ScopeMana
          node.parent = parentNode;
          transformIdentifier(node, scopeManager);
      } else if (node.type === 'MemberExpression') {
@@ -740,7 +1027,7 @@ index 9df1251..238f591 100644
          resolveCalleeObject(node.object, node, scopeManager);
      } else if (node.type === 'CallExpression') {
          if (node.callee && node.callee.type === 'MemberExpression') {
-@@ -1455,6 +1530,36 @@ function resolveCalleeObject(node: any, parentNode: any, scopeManager: ScopeMana
+@@ -1455,6 +1576,36 @@ function resolveCalleeObject(node: any, parentNode: any, scopeManager: ScopeMana
      }
  }
  
@@ -777,7 +1064,7 @@ index 9df1251..238f591 100644
  /**
   * True when `transformCallExpression` kept a lazy-operand call inline (see
   * LazyOperandPass). Such a node is fully transformed — callee and arguments
-@@ -1528,6 +1633,10 @@ function transformCallExpressionInner(node: any, scopeManager: ScopeManager, nam
+@@ -1528,6 +1679,10 @@ function transformCallExpressionInner(node: any, scopeManager: ScopeManager, nam
          }
  
          const namespace = node.callee.object.name;
@@ -788,7 +1075,7 @@ index 9df1251..238f591 100644
          // Transform arguments using the namespace's param
          const newArgs: any[] = [];
          node.arguments.forEach((arg: any) => {
-@@ -1649,6 +1758,7 @@ function transformCallExpressionInner(node: any, scopeManager: ScopeManager, nam
+@@ -1649,6 +1804,7 @@ function transformCallExpressionInner(node: any, scopeManager: ScopeManager, nam
          if (!scopeManager.shouldSuppressHoisting()) {
              const tempVarName = scopeManager.generateTempVar();
              scopeManager.addLocalSeriesVar(tempVarName); // Mark as local series
@@ -796,7 +1083,7 @@ index 9df1251..238f591 100644
  
              // Check if this CallExpression was inside an await expression
              const wasInsideAwait = node._insideAwait === true;
-@@ -1765,6 +1875,8 @@ function transformCallExpressionInner(node: any, scopeManager: ScopeManager, nam
+@@ -1765,6 +1921,8 @@ function transformCallExpressionInner(node: any, scopeManager: ScopeManager, nam
                  const fieldType = scopeManager.getUdtTypeFields(baseUdtType)?.[_obj.property.name];
                  receiverBaseType = normalizePineBaseType(fieldType);
              }
@@ -805,7 +1092,7 @@ index 9df1251..238f591 100644
          }
          const methodReceiverType = scopeManager.getMethodReceiverType(methodName);
          const receiverTypeMatches = !!receiverBaseType && !!methodReceiverType && receiverBaseType === methodReceiverType;
-@@ -1982,8 +2094,15 @@ function transformCallExpressionInner(node: any, scopeManager: ScopeManager, nam
+@@ -1982,8 +2140,15 @@ function transformCallExpressionInner(node: any, scopeManager: ScopeManager, nam
          // Case 2 — Chained: $.get(X, N).field.method()
          //   callee.object is a MemberExpression (the .field access), with $.get() deeper
          const isChained = calleeObj?.type === 'MemberExpression' && hasGetCallInChain(calleeObj);
@@ -1190,6 +1477,152 @@ index 0000000..b7d43f2
 +        expect(vals('sma')).toEqual(vals('sma_ref'));
 +    });
 +});
+diff --git a/tests/namespaces/ta-vwap-trading-day.test.ts b/tests/namespaces/ta-vwap-trading-day.test.ts
+new file mode 100644
+index 0000000..4657479
+--- /dev/null
++++ b/tests/namespaces/ta-vwap-trading-day.test.ts
+@@ -0,0 +1,140 @@
++import { describe, it, expect } from 'vitest';
++import { PineTS } from '../../src/PineTS.class';
++
++// Regression guard: `ta.vwap` (bare and `ta.vwap(src)`) resets at a new TRADING
++// day — TradingView's default anchor, `timeframe.change("1D")` — not at the
++// calendar midnight of the exchange timezone. For CME futures (session
++// 1700-1600 America/Chicago) the trading day opens at 17:00 CT, so the reset
++// falls on the 17:00 bar and NOT on the 00:00 bar. `timeframe.change("D")`
++// follows the same boundary, and `ta.vwap(src, anchor, mult)` returns
++// [vwap, upper, lower].
++
++type Bar = { openTime: number; open: number; high: number; low: number; close: number; volume: number; closeTime: number };
++
++function makeProvider(bars: Bar[], session: string, timezone: string) {
++    return {
++        async getMarketData(_t: string, _tf: string, limit?: number, sDate?: number, eDate?: number) {
++            let out = bars;
++            if (sDate) out = out.filter((b) => b.openTime >= sDate);
++            if (eDate) out = out.filter((b) => b.openTime <= eDate);
++            if (limit) out = out.slice(-limit);
++            return out;
++        },
++        async getSymbolInfo() {
++            return { ticker: 'X', tickerid: 'X:X', type: 'futures', mintick: 0.25, pricescale: 100, minmove: 1, pointvalue: 1, currency: 'USD', timezone, session };
++        },
++        configure() {},
++    };
++}
++
++// 30-minute bars over the given UTC windows; deterministic prices/volumes.
++function makeBars(isOpen: (t: number) => boolean, start: number, end: number): Bar[] {
++    let seed = 7;
++    const rnd = () => (seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296;
++    const out: Bar[] = [];
++    let p = 100;
++    for (let t = start; t < end; t += 30 * 60_000) {
++        if (!isOpen(t)) continue;
++        const o = p;
++        const c = o + (rnd() - 0.5) * 4;
++        out.push({ openTime: t, open: o, high: Math.max(o, c) + rnd(), low: Math.min(o, c) - rnd(), close: c, volume: 100 + Math.floor(rnd() * 900), closeTime: t + 30 * 60_000 - 1 });
++        p = c;
++    }
++    return out;
++}
++
++// Reference VWAP over hlc3 that resets on bars where `isReset(t)` is true.
++function referenceVwap(bars: Bar[], isReset: (t: number, i: number) => boolean): number[] {
++    let pv = 0, v = 0;
++    return bars.map((b, i) => {
++        if (i === 0 || isReset(b.openTime, i)) { pv = 0; v = 0; }
++        const src = (b.high + b.low + b.close) / 3;
++        pv += src * b.volume;
++        v += b.volume;
++        return pv / v;
++    });
++}
++
++const CODE = `
++//@version=5
++indicator("t")
++[m, u, l] = ta.vwap(hlc3, timeframe.change("D"), 1)
++plot(ta.vwap, "bare")
++plot(ta.vwap(hlc3), "src")
++plot(m, "m")
++plot(u, "u")
++plot(l, "l")
++plot(timeframe.change("D") ? 1 : 0, "chg")
++`;
++
++const close = (a: number, b: number) => Math.abs(a - b) < 1e-6 * Math.max(1, Math.abs(b));
++
++describe('ta.vwap resets at the trading-day open', () => {
++    it('CME 1700-1600 America/Chicago: resets at 17:00 CT, not at midnight', async () => {
++        // July → CDT (UTC-5): 17:00 CT = 22:00 UTC, 16:00 CT = 21:00 UTC.
++        // Sun 2024-07-07 22:00 UTC (Sun 17:00 CT) → Fri 2024-07-12 21:00 UTC.
++        const start = Date.UTC(2024, 6, 7, 22);
++        const end = Date.UTC(2024, 6, 12, 21);
++        const isOpen = (t: number) => new Date(t).getUTCHours() !== 21; // daily 16:00-17:00 CT halt
++        const bars = makeBars(isOpen, start, end);
++        const pine = new PineTS(makeProvider(bars, '1700-1600', 'America/Chicago') as any, 'X', '30', null, start, end);
++        const { plots } = await pine.run(CODE);
++        const vals = (k: string) => plots[k].data.map((d: any) => d.value);
++
++        const expected = referenceVwap(bars, (t) => new Date(t).getUTCHours() === 22 && new Date(t).getUTCMinutes() === 0);
++        const bare = vals('bare');
++        expect(bare.length).toBe(bars.length);
++        bare.forEach((x: number, i: number) => expect(close(x, expected[i])).toBe(true));
++        expect(vals('src')).toEqual(bare);
++
++        // Not a midnight reset: at 00:00 CT (05:00 UTC) the VWAP is not just that bar's hlc3.
++        const midnight = bars.findIndex((b) => new Date(b.openTime).getUTCHours() === 5);
++        const hlc3 = (b: Bar) => (b.high + b.low + b.close) / 3;
++        expect(close(bare[midnight], hlc3(bars[midnight]))).toBe(false);
++
++        // timeframe.change("D") fires exactly on the 17:00 CT bars (after the first bar).
++        const chg = vals('chg');
++        bars.forEach((b, i) => {
++            if (i === 0) return;
++            const at17 = new Date(b.openTime).getUTCHours() === 22 && new Date(b.openTime).getUTCMinutes() === 0;
++            expect(chg[i]).toBe(at17 ? 1 : 0);
++        });
++
++        // Anchored form with bands: same VWAP, symmetric bands, zero width at the reset bar.
++        const m = vals('m'), u = vals('u'), l = vals('l');
++        m.forEach((x: number, i: number) => expect(close(x, expected[i])).toBe(true));
++        u.forEach((x: number, i: number) => {
++            expect(x).toBeGreaterThanOrEqual(m[i] - 1e-9);
++            expect(close(x - m[i], m[i] - l[i])).toBe(true);
++        });
++        const reset = bars.findIndex((b, i) => i > 0 && new Date(b.openTime).getUTCHours() === 22 && new Date(b.openTime).getUTCMinutes() === 0);
++        expect(close(u[reset], m[reset])).toBe(true);
++        expect(u.some((x: number, i: number) => x - m[i] > 0.01)).toBe(true);
++    });
++
++    it('equity 0930-1600 America/New_York: resets at the 09:30 open', async () => {
++        // July → EDT (UTC-4): 09:30 ET = 13:30 UTC, 16:00 ET = 20:00 UTC. Mon-Fri.
++        const start = Date.UTC(2024, 6, 8, 13, 30);
++        const end = Date.UTC(2024, 6, 12, 20);
++        const isOpen = (t: number) => {
++            const d = new Date(t);
++            const m = d.getUTCHours() * 60 + d.getUTCMinutes();
++            return m >= 13 * 60 + 30 && m < 20 * 60;
++        };
++        const bars = makeBars(isOpen, start, end);
++        const pine = new PineTS(makeProvider(bars, '0930-1600', 'America/New_York') as any, 'X', '30', null, start, end);
++        const { plots } = await pine.run(CODE);
++        const vals = (k: string) => plots[k].data.map((d: any) => d.value);
++
++        const at0930 = (t: number) => new Date(t).getUTCHours() === 13 && new Date(t).getUTCMinutes() === 30;
++        const expected = referenceVwap(bars, at0930);
++        const bare = vals('bare');
++        expect(bare.length).toBe(bars.length);
++        bare.forEach((x: number, i: number) => expect(close(x, expected[i])).toBe(true));
++        const chg = vals('chg');
++        bars.forEach((b, i) => {
++            if (i > 0) expect(chg[i]).toBe(at0930(b.openTime) ? 1 : 0);
++        });
++        expect(Math.max(...vals('u').map((x: number, i: number) => x - vals('m')[i]))).toBeGreaterThan(0.01);
++    });
++});
 diff --git a/tests/transpiler/array-element-method-dispatch.test.ts b/tests/transpiler/array-element-method-dispatch.test.ts
 new file mode 100644
 index 0000000..f16d105
@@ -1446,6 +1879,55 @@ index 0000000..0c5d247
 +        const { plots } = await makePineTS().run(code);
 +        expect(plots['v'].data.length).toBeGreaterThan(10);
 +        expect(Number.isFinite(plots['v'].data.at(-1)?.value)).toBe(true);
++    });
++});
+diff --git a/tests/transpiler/namespace-variable-history.test.ts b/tests/transpiler/namespace-variable-history.test.ts
+new file mode 100644
+index 0000000..f534cc1
+--- /dev/null
++++ b/tests/transpiler/namespace-variable-history.test.ts
+@@ -0,0 +1,43 @@
++import { describe, it, expect } from 'vitest';
++import { PineTS, Provider } from 'index';
++
++// Regression guard: `[N]` history on a namespace built-in VARIABLE —
++// `strategy.closedtrades[1]`, `strategy.position_size[1]`, `ta.tr[1]` — and on a
++// call result passed as an ARGUMENT (`plot(ta.sma(close, 3)[1])`). The object
++// was auto-called after the subscript was lowered, so `strategy.closedtrades()[1]`
++// read the current value (and `strategy.closedtrades > strategy.closedtrades[1]`
++// never fired); in arguments `plot.param(<scalar>, 1)` gave null.
++describe('history of namespace variables and of call results in arguments', () => {
++    it('matches the same values read through a variable', async () => {
++        const pineTS = new PineTS(Provider.Mock, 'BTCUSDC', 'D', null, new Date('2019-01-01').getTime(), new Date('2019-04-01').getTime());
++        const code = `
++//@version=5
++strategy("t")
++if bar_index % 10 == 0
++    strategy.entry("L", strategy.long, qty = 1)
++if bar_index % 10 == 5
++    strategy.close("L")
++ct = strategy.closedtrades + 0
++ps = strategy.position_size
++tr = ta.tr
++s = ta.sma(close, 3)
++plot(strategy.closedtrades > strategy.closedtrades[1] ? 1 : 0, "new_close")
++plot(ct > ct[1] ? 1 : 0, "new_close_ref")
++plot(strategy.closedtrades[1], "ct1")
++plot(ct[1], "ct1_ref")
++plot(strategy.position_size[1], "ps1")
++plot(ps[1], "ps1_ref")
++plot(ta.tr[1], "tr1")
++plot(tr[1], "tr1_ref")
++plot(ta.sma(close, 3)[1], "sma1")
++plot(s[1], "sma1_ref")
++`;
++        const { plots } = await pineTS.run(code);
++        const vals = (k: string) => plots[k].data.map((d: any) => d.value);
++        expect(vals('new_close').length).toBeGreaterThan(50);
++        expect(vals('new_close').filter((v: any) => v === 1).length).toBeGreaterThan(3);
++        for (const k of ['new_close', 'ct1', 'ps1', 'tr1', 'sma1']) {
++            expect(vals(k), k).toEqual(vals(k + '_ref'));
++        }
 +    });
 +});
 diff --git a/tests/transpiler/nested-param-member-chain.test.ts b/tests/transpiler/nested-param-member-chain.test.ts

@@ -193,6 +193,40 @@ plot(src == ta.vwap(hlc3) and not na(src) ? 1 : 0)`);
     expect(lastValue(r)).toBe(1);
   });
 
+  it('ta.vwap resets at the CME trading-day open (17:00 CT), not at midnight', async () => {
+    // Synthetic NQ: session 1700-1600 America/Chicago, 5m bars, 600 bars = 50 hours.
+    const r = await runPine({ source: `//@version=6
+indicator("p")
+open17 = hour == 17 and minute == 0
+mid = hour == 0 and minute == 0
+v = ta.vwap
+plot(open17 ? (math.abs(v - hlc3) < 1e-9 ? 1 : 0) : na)
+plot(mid ? (math.abs(v - hlc3) < 1e-9 ? 1 : 0) : na)
+plot(bar_index > 0 and timeframe.change("D") != open17 ? 1 : 0)`, tickerId: 'NQ', timeframe: '5', limit: 600, symbolInfo, fetchBars, timeoutMs: 30_000, maxSeriesBars: 600 });
+    expect(r.ok, r.error).toBe(true);
+    const [atOpen, atMidnight, mismatch] = r.series.plots.map((p) => p.values.filter((x) => x !== null));
+    expect(atOpen.length).toBeGreaterThan(0);
+    expect(atOpen.every((x) => x === 1)).toBe(true);
+    expect(atMidnight.length).toBeGreaterThan(0);
+    expect(atMidnight.every((x) => x === 0)).toBe(true);
+    expect(mismatch.every((x) => x === 0)).toBe(true);
+  });
+
+  it('strategy.closedtrades[1] is the previous bar count', async () => {
+    const r = await run(`//@version=5
+strategy("p")
+if bar_index % 10 == 0
+    strategy.entry("L", strategy.long, qty = 1)
+if bar_index % 10 == 5
+    strategy.close("L")
+ct = strategy.closedtrades + 0
+plot(strategy.closedtrades > strategy.closedtrades[1] ? 1 : 0)
+plot(ct > ct[1] ? 1 : 0)`);
+    expect(r.ok, r.error).toBe(true);
+    expect(r.series.plots[0].values).toEqual(r.series.plots[1].values);
+    expect(r.series.plots[0].values.filter((x) => x === 1).length).toBeGreaterThan(5);
+  });
+
   it('request.earnings and friends return na (built-in VWAP anchors)', async () => {
     const r = await run(`//@version=5
 indicator("p")

@@ -69,6 +69,16 @@ references (`$.var.…`, `$$.let.…`).
 20. **`strategy.opentrades` / `strategy.closedtrades` read as a value** (`plot(strategy.closedtrades)`,
     `strategy.opentrades == 0`, `str.tostring(strategy.closedtrades)`): the runtime object was taken
     for plot()'s named-args bag (title lost, values null) and `==` was always false.
+21. **VWAP and daily changes on the trading day**: `ta.vwap` (bare and `ta.vwap(src)`) reset at the
+    calendar midnight of the exchange timezone and `timeframe.change("D"/"W"/"M")` at 00:00 UTC.
+    TradingView uses the TRADING day: for CME futures (session `1700-1600` America/Chicago) that is
+    17:00 CT. Both now derive it from `syminfo.session` + `syminfo.timezone` (an overnight session
+    rolls at its open; same-day sessions such as `0930-1600` keep the calendar date).
+    `ta.vwap(src, anchor[, stdev_mult])` now honours `anchor` and returns `[vwap, upper, lower]`.
+    (Other higher-timeframe alignment — `time("D")`, `request.security` daily bars — is still UTC-based.)
+22. **History of namespace variables and call results in arguments**: `strategy.closedtrades[1]`,
+    `strategy.position_size[1]`, `ta.tr[1]` read the current value (`strategy.closedtrades >
+    strategy.closedtrades[1]` never fired), and `plot(ta.sma(close, 3)[1])` plotted nothing.
 
 PineTS's own suite gives the same result with and without the patch (no new failures);
 `test/pinets-patches.test.mjs` pins the cases here.
