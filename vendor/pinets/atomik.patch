@@ -495,6 +495,78 @@ index 0321c00..5da5e35 100644
  
    constructor(private context: any) {
      // Install methods
+diff --git a/src/namespaces/strategy/methods/exit.ts b/src/namespaces/strategy/methods/exit.ts
+index 2a5b527..7b3287f 100644
+--- a/src/namespaces/strategy/methods/exit.ts
++++ b/src/namespaces/strategy/methods/exit.ts
+@@ -122,6 +122,18 @@ export function exit(context: any) {
+               );
+         const attachedAtReversal = !!pendingEntry?._isReversalEntry;
+ 
++        // The open trades this exit is placed ON (from_entry filter; '' = all).
++        // Prices the user computed while these trades were open — a breakeven
++        // `stop = strategy.position_avg_price`, a stop locking in profit —
++        // describe THIS position, so processExitOrders trusts them as long as
++        // the exit still covers only these trades. Empty when the exit waits
++        // for an entry (nothing open yet) or rides a reversal.
++        const placedOnTradeIds: string[] = attachedAtReversal
++            ? []
++            : (context.strategy.opentrades as any[])
++                  .filter((t) => !fromEntryId || t.entry_id === fromEntryId)
++                  .map((t) => t.id);
++
+         // Cadence detection: persistent vs ephemeral capture.
+         // If the user called strategy.exit at THIS exact call site on the
+         // previous bar, the pattern is "every bar" (persistent — variable
+@@ -166,6 +178,7 @@ export function exit(context: any) {
+             _attachedAtReversal: attachedAtReversal,
+             _isPersistent: isPersistent,
+             _callsiteId: callsiteId,
++            _placed_on_trade_ids: placedOnTradeIds.length ? placedOnTradeIds : undefined,
+         };
+ 
+         // Pine semantic: calling strategy.exit with the same `id` REPLACES the
+diff --git a/src/namespaces/strategy/types.ts b/src/namespaces/strategy/types.ts
+index dfa9e25..2f64287 100644
+--- a/src/namespaces/strategy/types.ts
++++ b/src/namespaces/strategy/types.ts
+@@ -174,6 +174,13 @@ export interface Order {
+     // time — if none of the originally-intended trades are still open, the
+     // close order is cancelled.
+     _intended_trade_ids?: string[];
++
++    // Internal: the open trades (matching from_entry) when strategy.exit was
++    // called. While the exit still covers only these trades, its absolute
++    // limit/stop were priced off this position and are never treated as
++    // stale/wrong-sided (a breakeven stop sits exactly at the entry). See
++    // processExitOrders.
++    _placed_on_trade_ids?: string[];
+ }
+ 
+ /**
+diff --git a/src/namespaces/strategy/utils.ts b/src/namespaces/strategy/utils.ts
+index e350723..15cc212 100644
+--- a/src/namespaces/strategy/utils.ts
++++ b/src/namespaces/strategy/utils.ts
+@@ -1368,7 +1368,17 @@ export function processExitOrders(context: any, phase: 'open' | 'intrabar' = 'in
+         // of entry will still fire at the bar's open via gap-fill when
+         // the open is past the trigger. Dropping wrong-sided legs here
+         // would miss that.
+-        if (!order._isPersistent) {
++        //
++        // An exit placed while every trade it now covers was ALREADY OPEN is
++        // exempt: its prices were computed from this very position, so they
++        // cannot be stale. That is the "move the stop to breakeven / lock in
++        // profit after a partial" pattern — `stop = position_avg_price` sits
++        // AT the entry, so the check below would drop it and leave the runner
++        // with only its target. TV places such an order as given (a stop
++        // already through the market fills at the next open).
++        const placedOn = order._placed_on_trade_ids;
++        const placedOnThisPosition = !!placedOn && matching.every((t) => placedOn.includes(t.id));
++        if (!order._isPersistent && !placedOnThisPosition) {
+             if (absSl !== undefined) {
+                 const slValid = isLong ? absSl < avgEntry : absSl > avgEntry;
+                 if (!slValid) absSl = undefined;
 diff --git a/src/namespaces/ta/methods/vwap.ts b/src/namespaces/ta/methods/vwap.ts
 index f2415c4..8f058c4 100644
 --- a/src/namespaces/ta/methods/vwap.ts
@@ -1572,6 +1644,142 @@ index 0000000..0d7fbe0
 +        expect(t.some((v: any) => Number.isFinite(v) && v > 1.7e12)).toBe(true);
 +        expect(t).toEqual(plots['t_ref'].data.map((d: any) => d.value));
 +        expect(plots['tc'].data.map((d: any) => d.value)).toEqual(plots['tc_ref'].data.map((d: any) => d.value));
++    });
++});
+diff --git a/tests/namespaces/strategy/exit-placed-on-open-position.test.ts b/tests/namespaces/strategy/exit-placed-on-open-position.test.ts
+new file mode 100644
+index 0000000..0d019fc
+--- /dev/null
++++ b/tests/namespaces/strategy/exit-placed-on-open-position.test.ts
+@@ -0,0 +1,130 @@
++// SPDX-License-Identifier: AGPL-3.0-only
++
++/**
++ * A strategy.exit placed ONCE on a position that is already open keeps its
++ * stop when that stop sits at or past the entry price.
++ *
++ * The canonical case is "move the runner's stop to breakeven after a partial":
++ *
++ *     if partialFilled and not beDone
++ *         strategy.exit("TP2", "S", limit = target, stop = strategy.position_avg_price)
++ *         beDone := true
++ *
++ * The wrong-sided-leg check in processExitOrders (meant for prices computed
++ * from an OUTGOING position before a reversal) dropped that stop because it is
++ * not strictly beyond the entry, and kept the target: the runner could then
++ * only ever exit at its target, and a strategy that skips setups while in a
++ * trade stopped trading for good. TradingView places the order as given — a
++ * stop already through the market fills at the next open.
++ *
++ * Stale prices are still refused: an exit only counts as placed on a live
++ * position while every trade it covers was open when it was called, so a
++ * reversal or a later trade never inherits it.
++ */
++import { describe, it, expect } from 'vitest';
++import { PineTS } from '../../../src/PineTS.class';
++
++const T0 = Date.UTC(2026, 8, 17, 8, 0);
++const MIN = 60_000;
++
++// Flat at 20000; bar 11 dips to 19990 (short TP1) / bar 11 spikes to 20010
++// (long TP1); from bar 20 price moves `drift` points and stays there.
++function bars(drift: number, { dip = -10 }: { dip?: number } = {}) {
++    const out: any[] = [];
++    for (let i = 0; i < 40; i++) {
++        let o = 20000, h = 20001, l = 19999, c = 20000;
++        if (i === 11) {
++            if (dip < 0) l = 20000 + dip;
++            else h = 20000 + dip;
++        }
++        if (i >= 20) {
++            o = c = 20000 + drift;
++            h = o + 1;
++            l = o - 1;
++        }
++        out.push({ openTime: T0 + i * MIN, closeTime: T0 + i * MIN + MIN - 1, open: o, high: h, low: l, close: c, volume: 100 });
++    }
++    return out;
++}
++
++const HEADER = `//@version=6
++strategy("be", overlay=true, pyramiding=0, initial_capital=10000,
++     default_qty_type=strategy.fixed, default_qty_value=3, margin_long=0, margin_short=0)
++`;
++
++async function run(candles: any[], body: string) {
++    const pineTS = new PineTS(candles, 'MNQ', '1');
++    const ctx: any = await pineTS.run(HEADER + body);
++    return ctx.strategy;
++}
++
++// Short 3 at bar 11's open; 2 come off at 19995; the script then moves the
++// runner's stop to `beStop` once.
++const shortWithBreakeven = (beStop: string) => `
++var bool beDone = false
++if bar_index == 10
++    strategy.entry("S", strategy.short, qty = 3)
++    strategy.exit("S TP1", "S", qty = 2, limit = 19995, stop = 20050)
++    strategy.exit("S TP2", "S", limit = 19950, stop = 20050)
++if strategy.position_size != 0 and math.abs(strategy.position_size) < 3 and not beDone
++    strategy.exit("S TP2", "S", limit = 19950, stop = ${beStop})
++    beDone := true
++`;
++
++describe('strategy.exit placed on an open position', () => {
++    it('a one-off breakeven stop closes a short runner when price comes back', async () => {
++        const st = await run(bars(+10), shortWithBreakeven('strategy.position_avg_price'));
++        expect(st.opentrades.length).toBe(0);
++        const runner = st.closedtrades.find((t: any) => t.exit_id === 'S TP2');
++        expect(runner).toBeDefined();
++        expect(runner.exit_price).toBe(20000); // the next open after the stop was placed
++    });
++
++    it('a one-off profit-locking stop (beyond the entry) is honoured too', async () => {
++        const st = await run(bars(+10), shortWithBreakeven('strategy.position_avg_price - 2'));
++        expect(st.opentrades.length).toBe(0);
++        const runner = st.closedtrades.find((t: any) => t.exit_id === 'S TP2');
++        expect(runner.exit_price).toBe(20000); // already through the stop at the next open
++    });
++
++    it('mirrors for a long runner', async () => {
++        const st = await run(bars(-10, { dip: +10 }), `
++var bool beDone = false
++if bar_index == 10
++    strategy.entry("L", strategy.long, qty = 3)
++    strategy.exit("L TP1", "L", qty = 2, limit = 20005, stop = 19950)
++    strategy.exit("L TP2", "L", limit = 20050, stop = 19950)
++if strategy.position_size > 0 and strategy.position_size < 3 and not beDone
++    strategy.exit("L TP2", "L", limit = 20050, stop = strategy.position_avg_price)
++    beDone := true
++`);
++        expect(st.opentrades.length).toBe(0);
++        expect(st.closedtrades.find((t: any) => t.exit_id === 'L TP2')).toBeDefined();
++    });
++
++    it('without the breakeven move the original stop still governs the runner', async () => {
++        const st = await run(bars(+60), `
++if bar_index == 10
++    strategy.entry("S", strategy.short, qty = 3)
++    strategy.exit("S TP1", "S", qty = 2, limit = 19995, stop = 20050)
++    strategy.exit("S TP2", "S", limit = 19950, stop = 20050)
++`);
++        expect(st.opentrades.length).toBe(0);
++        expect(st.closedtrades.find((t: any) => t.exit_id === 'S TP2').exit_price).toBe(20060);
++    });
++
++    it('a stale stop attached to a reversal entry is still dropped', async () => {
++        // Long open; on bar 15 the script reverses short and prices the new
++        // short's stop off the OUTGOING long's average (wrong side for the
++        // short). TV ignores it; so do we.
++        const st = await run(bars(+10), `
++if bar_index == 5
++    strategy.entry("L", strategy.long, qty = 1)
++if bar_index == 15
++    strategy.entry("S", strategy.short, qty = 1)
++    strategy.exit("XS", "S", stop = strategy.position_avg_price - 5)
++`);
++        expect(st.opentrades.length).toBe(1);
++        expect(st.opentrades[0].entry_id).toBe('S');
 +    });
 +});
 diff --git a/tests/namespaces/strategy/trade-count-values.test.ts b/tests/namespaces/strategy/trade-count-values.test.ts
