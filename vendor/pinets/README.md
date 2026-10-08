@@ -88,6 +88,17 @@ references (`$.var.…`, `$$.let.…`).
     "ICT Time + Price Levels (TradeJorno)" went from ~21s to ~2.9s for 5,000 bars (90s on the
     production runner before). Results unchanged.
 
+**Strategy emulator**
+
+24. **A one-off breakeven / profit-locking stop was dropped**: `strategy.exit("TP2", "S", limit=…,
+    stop=strategy.position_avg_price)` called once after a partial (the usual "move the runner to
+    breakeven") lost its stop and kept its target, so the runner could only exit at the target. The
+    wrong-sided-leg check meant for prices taken from an OUTGOING position before a reversal treated
+    a stop AT or past the entry as stale. An exit now records the open trades it was placed on and
+    keeps its prices while it covers only those trades; exits riding a reversal or a later trade are
+    checked as before. Found live (Oct 7 2026): a strategy held a phantom position for three weeks
+    and skipped every setup "in a trade".
+
 PineTS's own suite gives the same result with and without the patch (no new failures);
 `test/pinets-patches.test.mjs` pins the cases here.
 

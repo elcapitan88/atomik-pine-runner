@@ -236,4 +236,30 @@ plot(na(e) and na(d) ? 1 : 0)`);
     expect(r.ok, r.error).toBe(true);
     expect(lastValue(r)).toBe(1);
   });
+
+  it('a one-off breakeven stop after a partial closes the runner', async () => {
+    // Short 3 at 20000; 2 come off at 19995 on the entry bar; the script then
+    // moves the runner's stop to breakeven ONCE. Price goes back up to 20010
+    // and stays: the runner must stop out, not ride forever waiting for its
+    // target (a script that skips setups while in a trade went silent).
+    const T0 = Date.UTC(2026, 8, 17, 8, 0);
+    const bars = Array.from({ length: 40 }, (_, i) => {
+      const p = i >= 20 ? 20010 : 20000;
+      return { openTime: T0 + i * 60_000, closeTime: T0 + i * 60_000 + 59_999, open: p, high: p + 1, low: i === 11 ? 19990 : p - 1, close: p, volume: 100 };
+    });
+    const r = await runPine({ source: `//@version=6
+strategy("be", overlay=true, pyramiding=0, initial_capital=10000, margin_long=0, margin_short=0)
+var bool beDone = false
+if bar_index == 10
+    strategy.entry("S", strategy.short, qty = 3)
+    strategy.exit("S TP1", "S", qty = 2, limit = 19995, stop = 20050)
+    strategy.exit("S TP2", "S", limit = 19950, stop = 20050)
+if strategy.position_size < 0 and strategy.position_size > -3 and not beDone
+    strategy.exit("S TP2", "S", limit = 19950, stop = strategy.position_avg_price)
+    beDone := true`, tickerId: 'NQ', timeframe: '1', limit: 40, symbolInfo, fetchBars: async () => bars, timeoutMs: 30_000 });
+    expect(r.ok, r.error).toBe(true);
+    expect(r.strategy.opentrades).toEqual([]);
+    const runner = r.strategy.closedtrades.find((t) => t.exit_id === 'S TP2');
+    expect(runner?.exit_price).toBe(20000);
+  });
 });
