@@ -125,9 +125,10 @@ async function backtest(job) {
 
 // Builder live preview: the script over the newest bars of the market it is
 // being built for, returned as the frame the dashboard chart draws (native
-// study series + drawings). A strategy's trades are left out on purpose: the
-// preview shows what the script draws, and only a backtest says what it would
-// have traded.
+// study series + drawings). With `trades`, a strategy's entries and exits come
+// as the same trade markers the dashboard draws (TradingView shows a
+// strategy's trades on its chart); without, they're left out. Never the
+// Strategy Tester's numbers: those are a backtest's job.
 async function preview(job) {
   const pineTf = atomikToPine(job.timeframe);
   if (!pineTf) return { ok: false, status: 400, detail: `Unsupported timeframe '${job.timeframe}'.` };
@@ -155,12 +156,13 @@ async function preview(job) {
     return { ok: true, preview: { ok: false, kind: null, title: null, errors: [{ line: parseLine(res.error), message }], warnings: [], inputs: [], bars: 0, ms: res.ms, frame: null } };
   }
   if (res.bars === 0) return { ok: false, status: 400, detail: `No recent data for ${job.symbol} ${job.timeframe}.` };
-  const frame = stateFrom({ ...res, strategy: null }, {
+  const frame = stateFrom(job.trades ? res : { ...res, strategy: null }, {
     strategyKey: job.key || 'builder-preview',
     symbol: job.symbol,
     rich: !!config.richDrawings,
     maxDrawings: config.maxDrawings ?? MAX_RICH_DRAWINGS,
   });
+  delete frame.tester;
   return {
     ok: true,
     preview: {

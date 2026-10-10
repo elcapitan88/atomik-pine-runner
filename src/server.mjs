@@ -2,7 +2,7 @@
 //   GET  /health
 //   POST /v1/compile   {source, symbol?, timeframe?, symbol_info?}
 //   POST /v1/backtest  {source, symbol, timeframe, start, end, symbol_info?}
-//   POST /v1/preview   {source, symbol, timeframe, bars?, inputs?, symbol_info?, key?}
+//   POST /v1/preview   {source, symbol, timeframe, bars?, inputs?, symbol_info?, key?, trades?}
 import Fastify from 'fastify';
 import { config } from './config.mjs';
 import { requireServiceKey } from './auth.mjs';
@@ -101,7 +101,8 @@ app.register(async (v1) => {
   });
 
   // The Builder's live preview: what the script draws over the newest bars of
-  // one market (values + drawings, never trades). Charges nothing upstream.
+  // one market (values + drawings, and a strategy's trade markers with
+  // `trades: true`; never the tester's numbers). Charges nothing upstream.
   v1.post('/preview', async (req, reply) => {
     const body = req.body || {};
     const bad = checkSource(body.source);
@@ -116,7 +117,7 @@ app.register(async (v1) => {
     // A backed-up pool means chart runs are waiting: a preview must not add to it.
     if (pool.stats.queued >= config.previewMaxQueue) return reply.code(503).send({ detail: 'The Pine engine is busy. The preview will retry.', busy: true });
     const key = typeof body.key === 'string' ? body.key.slice(0, 64) : null;
-    const res = await pool.run({ type: 'preview', source: body.source, symbol, timeframe: body.timeframe, bars, symbol_info: body.symbol_info || null, inputs, key }, { timeoutMs: config.previewTimeoutMs });
+    const res = await pool.run({ type: 'preview', source: body.source, symbol, timeframe: body.timeframe, bars, symbol_info: body.symbol_info || null, inputs, key, trades: body.trades === true }, { timeoutMs: config.previewTimeoutMs });
     if (!res.ok) return reply.code(res.status || 500).send({ detail: res.detail });
     return res.preview;
   });
