@@ -16,7 +16,8 @@ interact with.
   trades, metrics, an equity curve and chart output, in the same shape as Atomik's Python backtests.
 - `POST /v1/preview` — the Builder's live preview: runs a script over the newest `bars` (default 3,000,
   max 5,000) of one market and returns the frame the chart draws (native-study series + drawings).
-  A strategy's trades are left out on purpose. Refused with 503 while the worker queue is backed up.
+  `trades: true` adds a strategy's trade markers (never the Strategy Tester's numbers). Refused with 503 while
+  the worker queue is backed up.
 - `GET /health`
 - Live chart indicators (`src/live/`): every Pine script the backend reports as "shown on a chart"
   gets a session that warms up from the warehouse, aggregates DataHub trades into bars, keeps the

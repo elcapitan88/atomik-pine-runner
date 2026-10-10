@@ -191,6 +191,18 @@ describe('POST /v1/preview', () => {
     expect(j.frame.drawings.some((d) => d.kind === 'shape')).toBe(true);
   });
 
+  it("with trades: a strategy's trade markers, still never the tester", async () => {
+    const r = await post('/v1/preview', { source: SCRIPTS.ema_cross_strategy, symbol: 'NQ', timeframe: '5m', bars: 1000, trades: true });
+    expect(r.status).toBe(200);
+    const j = await r.json();
+    expect(j.frame.drawings.some((d) => /^te/.test(d.id))).toBe(true);
+    expect(j.frame.drawings.some((d) => /^tx/.test(d.id))).toBe(true);
+    expect(j.frame.tester).toBeUndefined();
+    // An indicator has no trades to show either way.
+    const ind = await (await post('/v1/preview', { source: SCRIPTS.fvg_boxes, symbol: 'NQ', timeframe: '5m', bars: 500, trades: true })).json();
+    expect(ind.frame.drawings.some((d) => /^t[exo]/.test(d.id))).toBe(false);
+  });
+
   it('a script error comes back as errors with the line, not a failure', async () => {
     const r = await post('/v1/preview', { source: SCRIPTS.bad_function, symbol: 'NQ', timeframe: '5m' });
     expect(r.status).toBe(200);
