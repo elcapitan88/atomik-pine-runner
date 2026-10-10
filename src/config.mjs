@@ -27,6 +27,15 @@ export const config = {
   // Symbol + timeframe used by /v1/compile when the caller names none.
   compileSymbol: env.PINE_COMPILE_SYMBOL || 'NQ',
   compileTimeframe: env.PINE_COMPILE_TIMEFRAME || '5m',
+  // Builder live preview (POST /v1/preview): the script over the newest N bars
+  // of one market, its plotted values and drawings only, never its trades.
+  // Bounded so a preview costs a second or two of a worker, not a backtest.
+  previewBars: int('PINE_PREVIEW_BARS', 3000),
+  previewMaxBars: int('PINE_PREVIEW_MAX_BARS', 5000),
+  previewTimeoutMs: int('PINE_PREVIEW_TIMEOUT_MS', 20_000),
+  // Previews are refused (503, the Builder retries) while this many jobs are
+  // already waiting: they must never pile up in front of chart runs.
+  previewMaxQueue: int('PINE_PREVIEW_MAX_QUEUE', 4),
   // Live chart indicators: DataHub trades -> bars -> PineTS -> Redis strategy_state.
   // All three must be set for the live manager to start.
   datahubWsUrl: env.DATAHUB_WS_URL || '',          // ws://atomik-datahub.internal:8000/ws

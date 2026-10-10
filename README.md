@@ -14,6 +14,9 @@ interact with.
   is a strategy or an indicator, its title, and any errors with line numbers.
 - `POST /v1/backtest` — runs a `strategy()` script over a date range of warehouse bars and returns
   trades, metrics, an equity curve and chart output, in the same shape as Atomik's Python backtests.
+- `POST /v1/preview` — the Builder's live preview: runs a script over the newest `bars` (default 3,000,
+  max 5,000) of one market and returns the frame the chart draws (native-study series + drawings).
+  A strategy's trades are left out on purpose. Refused with 503 while the worker queue is backed up.
 - `GET /health`
 - Live chart indicators (`src/live/`): every Pine script the backend reports as "shown on a chart"
   gets a session that warms up from the warehouse, aggregates DataHub trades into bars, keeps the
@@ -56,6 +59,10 @@ HTTP request ─▶ server.mjs (auth, validation) ─▶ pool.mjs ─▶ worker.
 | `PINE_ISOLATE_MEMORY_MB` | `256` | heap limit per run |
 | `PINE_COMPILE_TIMEOUT_MS` | `15000` | wall clock for `/v1/compile` |
 | `PINE_BACKTEST_TIMEOUT_MS` | `90000` | wall clock for `/v1/backtest` |
+| `PINE_PREVIEW_BARS` | `3000` | default window for `/v1/preview` |
+| `PINE_PREVIEW_MAX_BARS` | `5000` | largest window a preview may ask for |
+| `PINE_PREVIEW_TIMEOUT_MS` | `20000` | wall clock for `/v1/preview` |
+| `PINE_PREVIEW_MAX_QUEUE` | `4` | previews are refused while this many jobs wait |
 | `PINE_COMPILE_BARS` | `500` | bars used by the compile dry-run |
 | `DATAHUB_WS_URL` / `DATAHUB_API_KEY` | — | DataHub trade feed (live indicators) |
 | `REDIS_URL` | — | where chart state is published (live indicators) |
