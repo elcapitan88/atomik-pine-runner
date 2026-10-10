@@ -6,7 +6,7 @@
 import { config } from './config.mjs';
 import { runPine, PineStream } from './sandbox.mjs';
 import { mergeBar } from './live/bars.mjs';
-import { seriesSpec } from './live/state.mjs';
+import { seriesSpec, stateFrom, MAX_RICH_DRAWINGS } from './live/state.mjs';
 import { toBacktestPayload } from './translate.mjs';
 import * as warehouse from './warehouse.mjs';
 import { tickerToRoot } from './symbols.mjs';
@@ -121,6 +121,62 @@ async function backtest(job) {
   if (res.bars === 0) return { ok: false, status: 400, detail: `No historical data for ${job.symbol} ${job.timeframe} in that range.` };
   if (res.kind !== 'strategy') return { ok: false, status: 400, detail: 'This script is an indicator (no strategy.entry/exit calls), so there is nothing to backtest. It can still be shown on your chart.' };
   return { ok: true, backtest: { ...toBacktestPayload(res), kind: res.kind, title: res.title } };
+}
+
+// Builder live preview: the script over the newest bars of the market it is
+// being built for, returned as the frame the dashboard chart draws (native
+// study series + drawings). A strategy's trades are left out on purpose: the
+// preview shows what the script draws, and only a backtest says what it would
+// have traded.
+async function preview(job) {
+  const pineTf = atomikToPine(job.timeframe);
+  if (!pineTf) return { ok: false, status: 400, detail: `Unsupported timeframe '${job.timeframe}'.` };
+  const bars = Math.min(Math.max(Number(job.bars) || config.previewBars, 50), config.previewMaxBars);
+  const res = await runPine({
+    source: job.source,
+    tickerId: job.symbol,
+    timeframe: pineTf,
+    limit: bars,
+    symbolInfo: symbolInfoFor(job.symbol, job.symbol_info),
+    fetchBars,
+    timeoutMs: config.previewTimeoutMs,
+    memoryMb: config.isolateMemoryMb,
+    maxPlotPoints: 50,
+    maxSeriesBars: bars,
+    inputs: job.inputs || null,
+  });
+  if (!res.ok) {
+    if (res.reason === 'data') return { ok: false, status: 503, detail: res.error };
+    const message = res.reason === 'timeout'
+      ? `The script did not finish ${bars} bars within ${Math.round(config.previewTimeoutMs / 1000)}s. Check for runaway loops.`
+      : res.reason === 'disposed'
+        ? 'The script ran out of memory. Reduce array sizes or lookbacks.'
+        : cleanError(res.error);
+    return { ok: true, preview: { ok: false, kind: null, title: null, errors: [{ line: parseLine(res.error), message }], warnings: [], inputs: [], bars: 0, ms: res.ms, frame: null } };
+  }
+  if (res.bars === 0) return { ok: false, status: 400, detail: `No recent data for ${job.symbol} ${job.timeframe}.` };
+  const frame = stateFrom({ ...res, strategy: null }, {
+    strategyKey: job.key || 'builder-preview',
+    symbol: job.symbol,
+    rich: !!config.richDrawings,
+    maxDrawings: config.maxDrawings ?? MAX_RICH_DRAWINGS,
+  });
+  return {
+    ok: true,
+    preview: {
+      ok: true,
+      kind: res.kind,
+      title: res.title,
+      errors: [],
+      warnings: [...(res.warnings || []), ...res.logs.filter((l) => l.startsWith('warn'))].slice(0, 20),
+      inputs: res.inputs || [],
+      bars: res.bars,
+      first_time: res.firstTime ?? null,
+      last_time: res.lastTime ?? null,
+      ms: res.ms,
+      frame,
+    },
+  };
 }
 
 // Live chart run: the primary series comes from the session's own bar history
@@ -259,6 +315,7 @@ async function streamUpdate(job) {
 const HANDLERS = {
   compile,
   backtest,
+  preview,
   live_run: liveRun,
   stream_open: streamOpen,
   stream_update: streamUpdate,

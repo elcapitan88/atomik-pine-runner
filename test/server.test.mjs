@@ -165,3 +165,49 @@ describe('POST /v1/backtest', () => {
     expect(ok.status).toBe(200);
   }, 60_000);
 });
+
+describe('POST /v1/preview', () => {
+  it('an indicator: the frame the chart draws (series + drawings)', async () => {
+    const r = await post('/v1/preview', { source: SCRIPTS.fvg_boxes, symbol: 'NQ', timeframe: '5m', bars: 500, key: 'builder-preview-u1' });
+    expect(r.status).toBe(200);
+    const j = await r.json();
+    expect(j).toMatchObject({ ok: true, kind: 'indicator', title: 'FVG', errors: [] });
+    expect(j.bars).toBe(500);
+    expect(j.frame.strategy).toBe('builder-preview-u1');
+    expect(j.frame.symbol).toBe('NQ');
+    expect(j.frame.drawings.length).toBeGreaterThan(0);
+  });
+
+  it('a strategy: its plots and plotshapes, never its trades', async () => {
+    const r = await post('/v1/preview', { source: SCRIPTS.ema_cross_strategy, symbol: 'NQ', timeframe: '5m', bars: 1000 });
+    expect(r.status).toBe(200);
+    const j = await r.json();
+    expect(j.kind).toBe('strategy');
+    expect(j.frame.series.plots.map((p) => p.title)).toContain('fast');
+    expect(j.frame.series.times.length).toBe(1000);
+    expect(j.frame.tester).toBeUndefined();
+    // Trade markers are keyed te…/tx…/to…; the script's own plotshape stays.
+    expect(j.frame.drawings.some((d) => /^t[exo]/.test(d.id))).toBe(false);
+    expect(j.frame.drawings.some((d) => d.kind === 'shape')).toBe(true);
+  });
+
+  it('a script error comes back as errors with the line, not a failure', async () => {
+    const r = await post('/v1/preview', { source: SCRIPTS.bad_function, symbol: 'NQ', timeframe: '5m' });
+    expect(r.status).toBe(200);
+    const j = await r.json();
+    expect(j.ok).toBe(false);
+    expect(j.frame).toBeNull();
+    expect(j.errors[0].message).toBeTruthy();
+  });
+
+  it('refuses a bad window, a missing symbol or a bad timeframe', async () => {
+    expect((await post('/v1/preview', { source: SCRIPTS.fvg_boxes, symbol: 'NQ', timeframe: '5m', bars: 10 })).status).toBe(400);
+    expect((await post('/v1/preview', { source: SCRIPTS.fvg_boxes, symbol: 'NQ', timeframe: '5m', bars: 999999 })).status).toBe(400);
+    expect((await post('/v1/preview', { source: SCRIPTS.fvg_boxes, timeframe: '5m' })).status).toBe(400);
+    expect((await post('/v1/preview', { source: SCRIPTS.fvg_boxes, symbol: 'NQ', timeframe: '7m' })).status).toBe(400);
+  });
+
+  it('needs the service key', async () => {
+    expect((await post('/v1/preview', { source: SCRIPTS.fvg_boxes, symbol: 'NQ', timeframe: '5m' }, null)).status).toBe(401);
+  });
+});
