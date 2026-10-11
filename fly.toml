@@ -24,6 +24,12 @@ primary_region = "iad"
   # symbol/timeframe switch (computing a script takes ~0.5-2s), and one sync is
   # a single cheap GET guarded against overlap.
   PINE_LIVE_SYNC_SECONDS = "3"
+  # Live chart sessions kept open as streams (default 8). A stream costs ~80MB
+  # of RSS (7 sessions = 610MB, Oct 11) but only milliseconds per update; past
+  # the cap a session falls back to a full re-run of its history on every
+  # update, which costs a job worker seconds of CPU. 16 streams fit the
+  # 4GB machine below next to two 512MB job isolates.
+  PINE_MAX_STREAMS = "16"
 
 [http_service]
   internal_port = 8000
@@ -43,10 +49,13 @@ primary_region = "iad"
 # A dedicated core: shared CPUs are throttled to a small baseline once their
 # burst credit runs out, and live chart sessions are steady load (launch night
 # Oct 1: 45s timeouts, OOM-killed stream worker on shared-cpu-1x/1GB).
+# 4GB (Oct 2026): at 2GB, free memory sat near zero for most of every
+# trading day (Oct 5-9, median 1-190MB) with only four Pine members, and
+# Pine opening to every plan needs the headroom.
 [[vm]]
   cpu_kind = "performance"
   cpus = 1
-  memory_mb = 2048
+  memory_mb = 4096
 
 [[restart]]
   policy = "always"
