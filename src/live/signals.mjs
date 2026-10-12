@@ -9,10 +9,11 @@
 //     entries fill at the next bar's open in Pine, which the first intrabar
 //     run of that bar sees within seconds; stop/limit entries fill intrabar
 //     when price crosses, which the same runs catch.
-//   * A trade WE entered is exited when it shows up closed. This is sent even
-//     when Pine says its own stop/target closed it: if the broker holds a
-//     native bracket the backend finds the account flat and does nothing, and
-//     if it holds none the EXIT is what gets the trader flat.
+//   * A trade WE entered is exited when it shows up closed, whatever closed it
+//     in Pine (its own stop/target included). By default nothing rests at the
+//     broker (config.brokerBrackets), so this EXIT is the only thing that gets
+//     the trader flat; with brackets on, the backend's exit is reduce-only and
+//     does nothing when a resting leg got there first.
 //   * Nothing from before the session started is ever signalled: the first
 //     ledger is the baseline. A position Pine "holds" from history is not a
 //     position on the account.
@@ -48,16 +49,19 @@ export const liveSnapshot = (state) => Object.fromEntries(state.live);
 /**
  * Does this ledger need re-runs INSIDE the bar? Pine evaluates a script once
  * per bar close (unless calc_on_every_tick), and market entries fill at the
- * next open, which the boundary run sees. Only resting stop/limit ENTRY orders
- * and trailing exits can fill mid-bar (the broker holds the plain brackets).
+ * next open, which the boundary run sees. Resting stop/limit ENTRY orders and
+ * EXIT orders fill mid-bar, so they need the 1s re-runs — except plain
+ * stop/target exits when the broker holds them as a bracket (brokerBrackets).
  */
-export function needsIntrabar(strategy) {
+export function needsIntrabar(strategy, { brokerBrackets = false } = {}) {
   if (!strategy) return false;
   if (strategy.config?.calc_on_every_tick) return true;
   for (const o of strategy.pending_orders || []) {
     if (o.status && o.status !== 'pending') continue;
     if (o.category === 'entry' && o.type && o.type !== 'market') return true;
-    if (o.category === 'exit' && (num(o.trail_price) || num(o.trail_points) || num(o.trail_offset))) return true;
+    if (o.category !== 'exit') continue;
+    if (num(o.trail_price) || num(o.trail_points) || num(o.trail_offset)) return true;
+    if (!brokerBrackets && (num(o.stop) || num(o.limit) || num(o.loss) || num(o.profit))) return true;
   }
   return false;
 }

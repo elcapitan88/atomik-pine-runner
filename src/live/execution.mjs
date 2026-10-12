@@ -7,9 +7,12 @@ const ENTRY_DELAYS = [1000, 3000, 5000];
 const EXIT_DELAYS = [1000, 3000, 5000, 15000, 15000, 15000, 15000, 15000];
 
 export class ExecutionClient {
-  constructor({ backendUrl, apiKey, log = console, fetchImpl = fetch, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
+  constructor({ backendUrl, apiKey, brokerBrackets = false, log = console, fetchImpl = fetch, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
     this.url = `${backendUrl.replace(/\/$/, '')}/api/v1/trades/execute`;
     this.apiKey = apiKey;
+    // Off: entries carry no stop/target, so the backend rests nothing the
+    // member's script didn't place itself (see config.brokerBrackets).
+    this.brokerBrackets = brokerBrackets;
     this.log = log;
     this.fetch = fetchImpl;
     this.sleep = sleep;
@@ -30,8 +33,10 @@ export class ExecutionClient {
       comment: signal.comment || null,
       signal_id: signal.signal_id,
     };
-    if (signal.stop_loss != null) payload.stop_loss = signal.stop_loss;
-    if (signal.take_profit != null) payload.take_profit = signal.take_profit;
+    if (this.brokerBrackets) {
+      if (signal.stop_loss != null) payload.stop_loss = signal.stop_loss;
+      if (signal.take_profit != null) payload.take_profit = signal.take_profit;
+    }
     if (signal.exit_reason) payload.exit_reason = signal.exit_reason;
     payload.context = {
       source: 'pinets', trade_key: signal.trade_key ?? null, note: signal.note ?? null,
@@ -77,6 +82,7 @@ export class ExecutionClient {
 
   /** Move a resting bracket (single attempt: the previous level still protects the position). */
   async amend({ stop_loss = null, take_profit = null }, { strategyName, symbol }) {
+    if (!this.brokerBrackets) return { ok: true, skipped: true }; // nothing rests at the broker to move
     const payload = { strategy_name: strategyName, symbol };
     if (stop_loss != null) payload.stop_loss = stop_loss;
     if (take_profit != null) payload.take_profit = take_profit;

@@ -21,6 +21,13 @@ import { tickerToRoot } from '../symbols.mjs';
 import * as warehouse from '../warehouse.mjs';
 
 const liveKey = (s) => `pine_trading:${s.id}:${s.symbol}`;
+// A trading session's pulse, read by the backend's Pine session monitor: with
+// no resting bracket, a session that stops running while it holds a position
+// leaves that position with no exit at all. Written every TRADING_BEAT_MS,
+// expires after TRADING_BEAT_TTL_S, so a dead runner shows up as a missing key.
+const beatKey = (s) => `pine_trading:hb:${s.id}:${s.symbol}`;
+const TRADING_BEAT_MS = 15_000;
+const TRADING_BEAT_TTL_S = 180;
 
 export class LiveManager {
   constructor({ config, pool, streams = null, log = console, fetchImpl = fetch, warehouseImpl = warehouse }) {
@@ -36,7 +43,7 @@ export class LiveManager {
     // Trading: strategies activated on an account get their ledger diffed into
     // signals. With PINE_TRADING_ENABLED unset the signals are only logged
     // ("shadow"), which is how a strategy is checked before it trades.
-    this.execution = new ExecutionClient({ backendUrl: config.backendInternalUrl, apiKey: config.executionApiKey || '', log, fetchImpl });
+    this.execution = new ExecutionClient({ backendUrl: config.backendInternalUrl, apiKey: config.executionApiKey || '', brokerBrackets: !!config.brokerBrackets, log, fetchImpl });
     this.feed = new DataHubFeed({ url: config.datahubWsUrl, apiKey: config.datahubApiKey, onTrade: (s, p, z, ms) => this.#onTrade(s, p, z, ms), log });
     this.syncTimer = null;
     this.tickTimer = null;
@@ -44,6 +51,7 @@ export class LiveManager {
     this.lastSync = null;
     this.lastSyncError = null;
     this.reloadTimer = null;
+    this.lastTradingBeatAt = 0;
   }
 
   async start() {
@@ -74,7 +82,7 @@ export class LiveManager {
   get stats() {
     return {
       sessions: [...this.sessions.values()].map((s) => ({
-        key: s.key, symbol: s.symbol, timeframe: s.timeframe, bars: s.bars.length, runs: s.runs, intrabarRuns: s.intrabarRuns, intrabarMs: s.intrabarMs, lastRunMs: s.lastRunMs, lastBoundaryMs: s.lastBoundaryMs ?? null, lastError: s.lastError,
+        key: s.key, symbol: s.symbol, timeframe: s.timeframe, bars: s.bars.length, runs: s.runs, intrabarRuns: s.intrabarRuns, intrabarMs: s.intrabarMs, lastRunMs: s.lastRunMs, lastBoundaryMs: s.lastBoundaryMs ?? null, lastError: s.lastError, lastRunAt: s.lastRunAt ?? null, lastPrintAt: s.lastPrintAt ?? null,
         stream: this.streams ? { on: s.streamed, opens: s.streamOpens, bars: s.streamBars, heapMb: s.heapMb, off: s.streamOff || null, failures: s.streamFailures } : null,
         alerts: { sent: s.alertsSent, dropped: s.alertsDropped },
         trading: s.trading ? { strategy: s.strategyName, activations: s.activations.length, live_accounts: s.activations.filter((a) => !a.is_paper).length, positions: liveSnapshot(s.ledger), shadow: s.shadowSignals, sent: s.signalsSent, failed: s.signalsFailed, lastLatencyMs: s.lastLatencyMs, recent: s.signalLog.slice(-10) } : null,
@@ -197,6 +205,7 @@ export class LiveManager {
     for (const s of this.sessions.values()) {
       if (s.symbol !== symbol) continue;
       s.dirty = true;
+      s.lastPrintAt = now;
       if (!s.warmed || !s.closedPending) continue;
       // This print opened a new bar and closed the previous one (#onBar just
       // flagged the session). Run ONCE over the closed history plus the
@@ -226,7 +235,19 @@ export class LiveManager {
     }
   }
 
+  /** Write each trading session's pulse (see beatKey). Never throws. */
+  #tradingBeat(now) {
+    for (const s of this.sessions.values()) {
+      if (!s.trading) continue;
+      this.bus.setJson(beatKey(s), {
+        at: now, session: s.key, warmed: !!s.warmed, open_positions: s.ledger.live.size,
+        last_run_at: s.lastRunAt ?? null, last_print_at: s.lastPrintAt ?? null, last_error: s.lastError ?? null,
+      }, { ttlSeconds: TRADING_BEAT_TTL_S }).catch?.(() => {});
+    }
+  }
+
   // Test hooks (private methods aren't reachable from tests).
+  tradingBeatForTest(now = Date.now()) { this.#tradingBeat(now); }
   async intrabarTickForTest() { this.#intrabarTick(); await this.#drain(); }
   async onBarForTest(symbol, seconds, bar) { this.#onBar(symbol, seconds, bar); this.#flushClosed(0); await this.#drain(); }
   async onTradeForTest(symbol, price, size, ms) { this.#onTrade(symbol, price, size, ms); await this.#drain(); }
@@ -259,6 +280,7 @@ export class LiveManager {
   #intrabarTick() {
     this.#flushClosed(1000);
     const now = Date.now();
+    if (now - this.lastTradingBeatAt >= TRADING_BEAT_MS) { this.lastTradingBeatAt = now; this.#tradingBeat(now); }
     const chartFloor = (this.config.liveIntrabarSeconds || 5) * 1000;
     const streamFloor = this.config.liveStreamIntrabarMs || 1000;
     for (const s of this.sessions.values()) {
@@ -334,10 +356,11 @@ export class LiveManager {
           s.lastError = res.detail;
           this.log.warn?.(`live: ${s.key} run failed: ${res.detail}`);
         } else {
+          s.lastRunAt = Date.now();
           s.lastError = null;
           const fresh = this.#newAlerts(s, res.live);
           if (fresh.length) this.#sendAlerts(s, fresh);
-          if (s.trading) s.intrabarNeeded = needsIntrabar(res.live.strategy);
+          if (s.trading) s.intrabarNeeded = needsIntrabar(res.live.strategy, { brokerBrackets: !!this.config.brokerBrackets });
           if (s.trading && res.live.strategy) {
             try { await this.#trade(s, res.live.strategy, { full: isFull, lastTime: res.live.lastTime, triggerAt }); } catch (err) { this.log.error?.(`live: ${s.key} trade step failed: ${err.message}`); }
           }
@@ -545,7 +568,8 @@ export class LiveManager {
         .then((r) => { if (r.ok) s.signalsSent++; else s.signalsFailed++; rec.result = r.ok ? 'ok' : (r.status ? `http ${r.status}` : r.error || 'failed'); })
         .catch((err) => { s.signalsFailed++; rec.result = String(err?.message || err); });
     }
-    for (const a of amends) {
+    // Nothing rests at the broker unless brackets are on, so nothing to move.
+    for (const a of this.config.brokerBrackets ? amends : []) {
       const line = `AMEND "${s.strategyName}" ${s.symbol} sl=${a.stop_loss} tp=${a.take_profit}`;
       if (!enabled) { this.log.warn?.(`trade[shadow] ${s.key}: ${line}`); continue; }
       this.log.info?.(`trade ${s.key}: ${line}`);

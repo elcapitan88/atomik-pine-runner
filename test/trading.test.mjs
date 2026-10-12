@@ -13,11 +13,12 @@ function liveResult(bars, ledger) {
   return { kind: 'strategy', title: 'x', bars: bars.length, lastTime: bars.at(-1)?.openTime ?? null, plots: {}, shapes: [], drawings: { boxes: [], lines: [], labels: [] }, series: null, strategy: ledger };
 }
 
-async function setup({ tradingEnabled, items, ledgers }) {
+async function setup({ tradingEnabled, items, ledgers, brokerBrackets = false }) {
   const sent = [];
   const stored = {};
+  const ttls = {};
   const m = new LiveManager({
-    config: { ...base, tradingEnabled },
+    config: { ...base, tradingEnabled, brokerBrackets },
     pool: { run: async (job) => ({ ok: true, live: liveResult(job.bars, ledgers.shift() || { opentrades: [], closedtrades: [], pending_orders: [] }) }) },
     log: { info() {}, warn() {}, error() {} },
     fetchImpl: async (url, opts) => {
@@ -26,13 +27,13 @@ async function setup({ tradingEnabled, items, ledgers }) {
       return { status: 200, json: async () => ({ signal_processed: true }) };
     },
   });
-  m.bus = { publishState: async () => true, setJson: async (k, v) => { stored[k] = v; return true; }, getJson: async (k) => stored[k] ?? null, del: async (k) => { delete stored[k]; return true; }, stats: {} };
+  m.bus = { publishState: async () => true, setJson: async (k, v, o) => { stored[k] = v; ttls[k] = o?.ttlSeconds; return true; }, getJson: async (k) => stored[k] ?? null, del: async (k) => { delete stored[k]; return true; }, stats: {} };
   m.feed = { setSymbols() {}, stats: {} };
   await m.sync();
   const s = m.sessions.get('9:NQ');
   s.bars = [bar(0), bar(1), bar(2)];
   s.warmed = true;
-  return { m, s, sent, stored };
+  return { m, s, sent, stored, ttls };
 }
 
 const openL = (t = T0 + 3 * 300_000) => ({ id: 'trade_0', entry_id: 'L', entry_price: 100, entry_time: t, size: 1 });
@@ -78,13 +79,67 @@ describe('trade sessions', () => {
     expect(m.stats.sessions[0].trading).toMatchObject({ strategy: 'My Strat (pine #9)', activations: 1, live_accounts: 0, shadow: 1, sent: 0 });
   });
 
-  it('enabled: sends BUY with the bracket, then EXIT, in order, with the engine key', async () => {
+  it('enabled: sends BUY (no bracket by default), then EXIT, in order, with the engine key', async () => {
     const ledgers = [
       { opentrades: [], closedtrades: [], pending_orders: [] },
       { opentrades: [openL()], closedtrades: [], pending_orders: [bracket] },
       { opentrades: [], closedtrades: [closedL()], pending_orders: [] },
     ];
     const { m, s, sent, stored } = await setup({ tradingEnabled: true, items: [item()], ledgers });
+    await m.onBarForTest('NQ', 300, bar(3));
+    await m.onBarForTest('NQ', 300, bar(4));
+    await m.onBarForTest('NQ', 300, bar(5));
+    await s.outbox;
+    expect(sent.map((x) => x.body.action)).toEqual(['BUY', 'EXIT']);
+    expect(sent[0].url).toBe('http://backend/api/v1/trades/execute');
+    expect(sent[0].headers['X-API-Key']).toBe('engine-key');
+    expect(sent[0].body).toMatchObject({ strategy_name: 'My Strat (pine #9)', symbol: 'NQ', comment: 'L' });
+    expect(sent[0].body.stop_loss).toBeUndefined();
+    expect(sent[0].body.take_profit).toBeUndefined();
+    expect(sent[0].body.quantity).toBeUndefined();
+    expect(sent[1].body).toMatchObject({ comment: 'EXIT_FINAL', exit_reason: 'strategy_exit' });
+    expect(s.signalsSent).toBe(2);
+    expect(stored['pine_trading:9:NQ']).toBeUndefined(); // flat -> nothing to restore
+  });
+
+  it('without broker brackets an open trade with a stop/target re-runs intrabar and never amends', async () => {
+    const moved = { ...bracket, loss: 4 };
+    const ledgers = [
+      { opentrades: [], closedtrades: [], pending_orders: [] },
+      { opentrades: [openL()], closedtrades: [], pending_orders: [bracket] },
+      { opentrades: [openL()], closedtrades: [], pending_orders: [moved] }, // the script moves its stop
+    ];
+    const { m, s, sent } = await setup({ tradingEnabled: true, items: [item()], ledgers });
+    await m.onBarForTest('NQ', 300, bar(3));
+    await m.onBarForTest('NQ', 300, bar(4));
+    // The script's exit is only seen by re-running inside the bar.
+    expect(s.intrabarNeeded).toBe(true);
+    await m.onBarForTest('NQ', 300, bar(5));
+    await s.outbox;
+    expect(sent.map((x) => x.url)).toEqual(['http://backend/api/v1/trades/execute']);
+  });
+
+  it('a trading session writes its pulse for the backend monitor; viz sessions do not', async () => {
+    const { m, s, stored, ttls } = await setup({ tradingEnabled: true, items: [item()], ledgers: [] });
+    s.lastRunAt = 111; s.lastPrintAt = 222;
+    m.tradingBeatForTest(333);
+    await new Promise((r) => setImmediate(r));
+    expect(stored['pine_trading:hb:9:NQ']).toEqual({ at: 333, session: '9:NQ', warmed: true, open_positions: 0, last_run_at: 111, last_print_at: 222, last_error: null });
+    expect(ttls['pine_trading:hb:9:NQ']).toBe(180);
+    s.trading = false;
+    delete stored['pine_trading:hb:9:NQ'];
+    m.tradingBeatForTest(444);
+    await new Promise((r) => setImmediate(r));
+    expect(stored['pine_trading:hb:9:NQ']).toBeUndefined();
+  });
+
+  it('broker brackets on: the entry carries the bracket', async () => {
+    const ledgers = [
+      { opentrades: [], closedtrades: [], pending_orders: [] },
+      { opentrades: [openL()], closedtrades: [], pending_orders: [bracket] },
+      { opentrades: [], closedtrades: [closedL()], pending_orders: [] },
+    ];
+    const { m, s, sent, stored } = await setup({ tradingEnabled: true, items: [item()], ledgers, brokerBrackets: true });
     await m.onBarForTest('NQ', 300, bar(3));
     await m.onBarForTest('NQ', 300, bar(4));
     await m.onBarForTest('NQ', 300, bar(5));
