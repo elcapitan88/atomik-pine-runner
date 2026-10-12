@@ -2,7 +2,7 @@
 // backend (the user's notification bell) and the chart, once each, live only.
 import { describe, it, expect, afterEach } from 'vitest';
 import { runPine, PineStream } from '../src/sandbox.mjs';
-import { LiveManager } from '../src/live/manager.mjs';
+import { LiveManager, alertsWanted } from '../src/live/manager.mjs';
 import { barsFor, fetchBars, symbolInfo } from './synthetic.mjs';
 import { providerFor, upsert, ticksOf, baseOpts } from './stream-harness.mjs';
 
@@ -62,15 +62,17 @@ describe('alerts in the sandbox', () => {
 });
 
 describe('alerts on live sessions', () => {
-  function setup(results) {
+  function setup(results, active = {}) {
     const posts = [];
     const frames = [];
+    // `active` = extra fields of the one /active item (a function: per sync).
+    const item = () => ({ strategy_code_id: 3, strategy_key: 'k', symbol: 'NQ', timeframe: '5m', source: '//@version=6\nindicator("x")', ...(typeof active === 'function' ? active() : active) });
     const m = new LiveManager({
       config: { redisUrl: '', datahubWsUrl: '', datahubApiKey: '', backendInternalUrl: 'http://b', serviceKey: 'k', liveWarmupBars: 100, liveSyncSeconds: 30, liveRunTimeoutMs: 1000, liveIntrabarSeconds: 60, liveHeartbeatSeconds: 60 },
       pool: { run: async () => ({ ok: true, live: results.shift() }) },
       log: { info() {}, warn() {}, error() {} },
       fetchImpl: async (url, opts) => {
-        if (url.includes('/internal/pine/active')) return { ok: true, json: async () => [{ strategy_code_id: 3, strategy_key: 'k', symbol: 'NQ', timeframe: '5m', source: '//@version=6\nindicator("x")' }] };
+        if (url.includes('/internal/pine/active')) return { ok: true, json: async () => [item()] };
         posts.push({ url, body: JSON.parse(opts.body), key: opts.headers['X-API-Key'] });
         return { ok: true, json: async () => ({ ok: true }) };
       },
@@ -104,7 +106,7 @@ describe('alerts on live sessions', () => {
     expect(posts[0].body).toMatchObject({ strategy_code_id: 3, symbol: 'NQ', timeframe: '5m', alerts: [{ type: 'alert', message: 'new!' }] });
     const withAlerts = frames.filter((f) => f.alerts);
     expect(withAlerts).toEqual([{ alerts: [al(3, 'new!')], cache: false }]);
-    expect(m.stats.sessions[0].alerts).toEqual({ sent: 1, dropped: 0 });
+    expect(m.stats.sessions[0].alerts).toEqual({ on: true, sent: 1, dropped: 0 });
   });
 
   it('at most 20 a minute per session', async () => {
@@ -118,6 +120,48 @@ describe('alerts on live sessions', () => {
     await m.onBarForTest('NQ', 300, bar(3));
     await new Promise((r) => setTimeout(r, 10));
     expect(posts[0].body.alerts).toHaveLength(20);
-    expect(m.stats.sessions[0].alerts).toEqual({ sent: 20, dropped: 10 });
+    expect(m.stats.sessions[0].alerts).toEqual({ on: true, sent: 20, dropped: 10 });
+  });
+
+  it('a chart indicator with Alerts off notifies nowhere: no bell, no toast', async () => {
+    const { m, posts, frames } = setup([result(2, []), result(3, [al(3, 'quiet')])], { kind: 'viz', alerts: false });
+    await m.sync();
+    const s = m.sessions.get('3:NQ');
+    s.bars = [0, 1, 2].map(bar);
+    s.warmed = true;
+    await m.onBarForTest('NQ', 300, bar(2));
+    await m.onBarForTest('NQ', 300, bar(3));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(posts).toHaveLength(0);
+    expect(frames.filter((f) => f.alerts)).toEqual([]);
+    expect(m.stats.sessions[0].alerts).toEqual({ on: false, sent: 0, dropped: 0 });
+  });
+
+  it('turning Alerts on keeps the session and never replays what it already ran', async () => {
+    let on = false;
+    const { m, posts } = setup([
+      result(2, []),
+      result(3, [al(3, 'while off')]),
+      result(4, [al(3, 'while off'), al(4, 'after on')]),
+    ], () => ({ kind: 'viz', alerts: on }));
+    await m.sync();
+    const s = m.sessions.get('3:NQ');
+    s.bars = [0, 1, 2].map(bar);
+    s.warmed = true;
+    await m.onBarForTest('NQ', 300, bar(2));
+    await m.onBarForTest('NQ', 300, bar(3));
+    on = true;
+    await m.sync();
+    expect(m.sessions.get('3:NQ')).toBe(s);   // same session: no rebuild, no re-warm
+    await m.onBarForTest('NQ', 300, bar(4));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(posts.flatMap((p) => p.body.alerts.map((a) => a.message))).toEqual(['after on']);
+  });
+
+  it('who alerts: strategies always, chart indicators only with Alerts on', () => {
+    expect(alertsWanted({ kind: 'trade', alerts: false })).toBe(true);
+    expect(alertsWanted({ kind: 'viz', alerts: true })).toBe(true);
+    expect(alertsWanted({ kind: 'viz', alerts: false })).toBe(false);
+    expect(alertsWanted({ kind: 'viz' })).toBe(true);   // a backend that predates the field
   });
 });

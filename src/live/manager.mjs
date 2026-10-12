@@ -22,6 +22,16 @@ import * as warehouse from '../warehouse.mjs';
 
 const liveKey = (s) => `pine_trading:${s.id}:${s.symbol}`;
 
+/**
+ * Whether a session's alert()/alertcondition() hits go to the member's bell.
+ * A trade session: always. A chart indicator: only with Alerts on, which the
+ * backend sends as `alerts` (PINE_SESSION_CAPS_PLAN.md). A backend that
+ * predates the field sends none: every session alerts, as before.
+ */
+export function alertsWanted(item) {
+  return item?.kind === 'trade' || item?.alerts !== false;
+}
+
 export class LiveManager {
   constructor({ config, pool, streams = null, log = console, fetchImpl = fetch, warehouseImpl = warehouse }) {
     this.config = config;
@@ -76,7 +86,7 @@ export class LiveManager {
       sessions: [...this.sessions.values()].map((s) => ({
         key: s.key, symbol: s.symbol, timeframe: s.timeframe, bars: s.bars.length, runs: s.runs, intrabarRuns: s.intrabarRuns, intrabarMs: s.intrabarMs, lastRunMs: s.lastRunMs, lastBoundaryMs: s.lastBoundaryMs ?? null, lastError: s.lastError,
         stream: this.streams ? { on: s.streamed, opens: s.streamOpens, bars: s.streamBars, heapMb: s.heapMb, off: s.streamOff || null, failures: s.streamFailures } : null,
-        alerts: { sent: s.alertsSent, dropped: s.alertsDropped },
+        alerts: { on: !!s.alerts, sent: s.alertsSent, dropped: s.alertsDropped },
         trading: s.trading ? { strategy: s.strategyName, activations: s.activations.length, live_accounts: s.activations.filter((a) => !a.is_paper).length, positions: liveSnapshot(s.ledger), shadow: s.shadowSignals, sent: s.signalsSent, failed: s.signalsFailed, lastLatencyMs: s.lastLatencyMs, recent: s.signalLog.slice(-10) } : null,
       })),
       trading: { enabled: !!this.config.tradingEnabled, execution: this.execution.stats },
@@ -133,6 +143,7 @@ export class LiveManager {
         const cur = this.sessions.get(key);
         const activations = Array.isArray(it.activations) ? it.activations : [];
         const trading = it.kind === 'trade' && activations.length > 0 && !!it.strategy_name;
+        const alerts = alertsWanted(it);
         const inputs = it.inputs && typeof it.inputs === 'object' ? it.inputs : null;
         const inputsKey = JSON.stringify(inputs || {});
         if (cur && cur.source === it.source && cur.timeframe === it.timeframe && cur.strategyKey === it.strategy_key && cur.inputsKey === inputsKey) {
@@ -141,6 +152,8 @@ export class LiveManager {
           if (trading && !cur.trading) this.log.info?.(`live: ${key} now trading as "${it.strategy_name}" (${activations.length} account(s))`);
           if (!trading && cur.trading) this.log.info?.(`live: ${key} stopped trading`);
           cur.trading = trading; cur.activations = activations; cur.strategyName = it.strategy_name || cur.strategyName; cur.symbolInfo = it.symbol_info || cur.symbolInfo;
+          if (alerts !== cur.alerts) this.log.info?.(`live: ${key} alerts ${alerts ? 'on' : 'off'}`);
+          cur.alerts = alerts;
           continue;
         }
         const s = {
@@ -149,7 +162,7 @@ export class LiveManager {
           inputs, inputsKey,
           // Alerts: the first run is the baseline (history never alerts); after
           // that each alert is sent once (key = type|callsite|bar|message).
-          alertFloor: null, alertSeen: new Set(), alertTimes: [], alertsSent: 0, alertsDropped: 0,
+          alertFloor: null, alertSeen: new Set(), alertTimes: [], alertsSent: 0, alertsDropped: 0, alerts,
           bars: [], warmed: false, runs: 0, intrabarRuns: 0, lastRunMs: null, lastError: null, lastHash: null, lastPayload: null, lastPartialHash: null, running: false, pending: false, wantBoundary: false, closedPending: false, closedAt: 0, dirty: false, lastIntrabarAt: 0, triggerAt: 0, intrabarMs: (this.config.liveIntrabarSeconds || 5) * 1000, intrabarNeeded: false,
           streamed: false, streamLast: null, streamBars: 0, streamOpens: 0, streamFailures: 0, streamOff: false, streamRetryAt: 0, heapMb: null,
           trading, activations, strategyName: it.strategy_name || null, ledger: newLedgerState(), outbox: Promise.resolve(), shadowSignals: 0, signalsSent: 0, signalsFailed: 0, signalLog: [], lastLatencyMs: null,
@@ -335,7 +348,11 @@ export class LiveManager {
           this.log.warn?.(`live: ${s.key} run failed: ${res.detail}`);
         } else {
           s.lastError = null;
-          const fresh = this.#newAlerts(s, res.live);
+          // Deduped even when they aren't sent, so turning Alerts on later
+          // never replays bars the session already ran. With Alerts off a
+          // chart indicator notifies nowhere: no bell, no toast on the chart.
+          const unseen = this.#newAlerts(s, res.live);
+          const fresh = s.alerts ? unseen : [];
           if (fresh.length) this.#sendAlerts(s, fresh);
           if (s.trading) s.intrabarNeeded = needsIntrabar(res.live.strategy);
           if (s.trading && res.live.strategy) {
