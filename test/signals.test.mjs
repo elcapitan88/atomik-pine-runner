@@ -151,7 +151,13 @@ describe('needsIntrabar', () => {
     expect(needsIntrabar(null)).toBe(false);
     expect(needsIntrabar({ pending_orders: [] })).toBe(false);
     expect(needsIntrabar({ pending_orders: [{ category: 'entry', type: 'market', status: 'pending' }] })).toBe(false);
-    expect(needsIntrabar({ pending_orders: [{ category: 'exit', profit: 10, loss: 5, status: 'pending' }] })).toBe(false);
+    // A plain stop/target exit fills mid-bar too: nothing rests at the broker
+    // by default, so the 1s re-runs are what catch it. Only when the broker
+    // holds it as a bracket can the runner wait for the bar.
+    expect(needsIntrabar({ pending_orders: [{ category: 'exit', profit: 10, loss: 5, status: 'pending' }] })).toBe(true);
+    expect(needsIntrabar({ pending_orders: [{ category: 'exit', stop: 99, status: 'pending' }] })).toBe(true);
+    expect(needsIntrabar({ pending_orders: [{ category: 'exit', profit: 10, loss: 5, status: 'pending' }] }, { brokerBrackets: true })).toBe(false);
+    expect(needsIntrabar({ pending_orders: [{ category: 'exit', trail_points: 20, status: 'pending' }] }, { brokerBrackets: true })).toBe(true);
     expect(needsIntrabar({ pending_orders: [{ category: 'entry', type: 'limit', status: 'pending' }] })).toBe(true);
     expect(needsIntrabar({ pending_orders: [{ category: 'entry', type: 'stop', status: 'filled' }] })).toBe(false);
     expect(needsIntrabar({ pending_orders: [{ category: 'exit', trail_points: 20, status: 'pending' }] })).toBe(true);
@@ -160,21 +166,31 @@ describe('needsIntrabar', () => {
 });
 
 describe('ExecutionClient', () => {
-  const mk = (responses) => {
+  const mk = (responses, { brokerBrackets = false } = {}) => {
     const calls = [];
     const fetchImpl = async (url, opts) => { calls.push({ url, body: JSON.parse(opts.body) }); const r = responses.shift(); if (r instanceof Error) throw r; return { status: r.status, json: async () => r.body }; };
-    const c = new ExecutionClient({ backendUrl: 'http://b', apiKey: 'k', log: { info() {}, error() {} }, fetchImpl, sleep: async () => {} });
+    const c = new ExecutionClient({ backendUrl: 'http://b', apiKey: 'k', brokerBrackets, log: { info() {}, error() {} }, fetchImpl, sleep: async () => {} });
     return { c, calls };
   };
 
-  it('posts the engine-shaped payload and reports success', async () => {
+  it('posts the engine-shaped payload and reports success; no stop/target rides along by default', async () => {
     const { c, calls } = mk([{ status: 200, body: { success: true } }]);
     const r = await c.send({ action: 'BUY', comment: 'L', signal_id: 'abc', stop_loss: 1, take_profit: 2, trade_key: 'L|1|1', entry_price: 100 }, { strategyName: 'X (pine #1)', symbol: 'NQ' });
     expect(r.ok).toBe(true);
     expect(calls[0].url).toBe('http://b/api/v1/trades/execute');
-    expect(calls[0].body).toMatchObject({ strategy_name: 'X (pine #1)', symbol: 'NQ', action: 'BUY', comment: 'L', signal_id: 'abc', stop_loss: 1, take_profit: 2 });
+    expect(calls[0].body).toMatchObject({ strategy_name: 'X (pine #1)', symbol: 'NQ', action: 'BUY', comment: 'L', signal_id: 'abc' });
+    // The backend rests a bracket for any entry that carries levels: by
+    // default the member's script is the only thing that exits.
+    expect(calls[0].body).not.toHaveProperty('stop_loss');
+    expect(calls[0].body).not.toHaveProperty('take_profit');
     expect(calls[0].body.context).toMatchObject({ source: 'pinets', trade_key: 'L|1|1', pine_entry_price: 100 });
     expect(c.stats.sent).toBe(1);
+  });
+
+  it('with broker brackets on, the stop/target ride on the entry', async () => {
+    const { c, calls } = mk([{ status: 200, body: { success: true } }], { brokerBrackets: true });
+    await c.send({ action: 'BUY', comment: 'L', signal_id: 'abc', stop_loss: 1, take_profit: 2 }, { strategyName: 'X', symbol: 'NQ' });
+    expect(calls[0].body).toMatchObject({ stop_loss: 1, take_profit: 2 });
   });
 
   it('retries transport errors with the same signal_id; gives up on 4xx', async () => {
@@ -191,8 +207,16 @@ describe('ExecutionClient', () => {
     expect(bad.c.stats.failed).toBe(1);
   });
 
+  it('amend is a no-op without broker brackets (nothing rests to move)', async () => {
+    const { c, calls } = mk([]);
+    const r = await c.amend({ stop_loss: 97, take_profit: null }, { strategyName: 'X', symbol: 'NQ' });
+    expect(r).toEqual({ ok: true, skipped: true });
+    expect(calls).toEqual([]);
+    expect(c.stats.amended).toBe(0);
+  });
+
   it('amend posts to /bracket/amend once', async () => {
-    const { c, calls } = mk([{ status: 200, body: { amended: 1 } }]);
+    const { c, calls } = mk([{ status: 200, body: { amended: 1 } }], { brokerBrackets: true });
     const r = await c.amend({ stop_loss: 97, take_profit: null }, { strategyName: 'X', symbol: 'NQ' });
     expect(r.ok).toBe(true);
     expect(calls[0].url).toBe('http://b/api/v1/trades/bracket/amend');

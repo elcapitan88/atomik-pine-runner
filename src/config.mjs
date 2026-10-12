@@ -79,6 +79,13 @@ export const config = {
   // strategy engine's (the same one DataHub accepts).
   tradingEnabled: env.PINE_TRADING_ENABLED === 'true',
   executionApiKey: env.EXECUTION_API_KEY || env.DATAHUB_API_KEY || '',
+  // Broker brackets: also rest the script's stop/target as real orders on the
+  // account (and move them when the script does). OFF: the script is the only
+  // thing that exits, as on TradingView, where strategy.exit never places an
+  // order the member didn't. Two closers on one trade is how a resting target
+  // and the script's own EXIT both closed a short and the second close opened
+  // a long on a paper account (2026-10-12).
+  brokerBrackets: env.PINE_BROKER_BRACKETS === 'true',
   get isProduction() {
     return this.environment === 'production';
   },
