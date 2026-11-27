@@ -126,9 +126,10 @@ if bar_index % 50 == 0
     open.push(r.stream);
     expect(r.error).toBeUndefined();
     expect(r.oneShot.ok, r.oneShot.error).toBe(true);
-    // PineTS's raw ids moved on with every tick of the stream...
-    expect(r.streamed.drawings.labels[0].id).not.toBe(r.oneShot.drawings.labels[0].id);
-    // ...the chart's do not.
+    // The stream rolls PineTS's id counters back with a discarded tick
+    // (PineTS >= 0.14 numbers drawings from module counters), so raw ids match...
+    expect(r.streamed.drawings.labels[0].id).toBe(r.oneShot.drawings.labels[0].id);
+    // ...and so do the chart's, which never depended on them.
     const a = stateFrom(r.streamed, RICH).drawings;
     const b = stateFrom(r.oneShot, RICH).drawings;
     expect(a.length).toBeGreaterThan(20);
