@@ -1,6 +1,10 @@
 FROM node:24-slim
 
 ENV NODE_ENV=production
+# Each isolate runs on its own thread; glibc gives busy threads their own
+# malloc arenas and rarely hands freed memory back, so worker RSS ratchets up
+# to the heaviest job it ever ran. Two arenas keep it close to what's in use.
+ENV MALLOC_ARENA_MAX=2
 WORKDIR /app
 
 COPY package.json package-lock.json ./

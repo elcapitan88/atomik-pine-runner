@@ -39,6 +39,24 @@ export function alertsWanted(item) {
   return item?.kind === 'trade' || item?.alerts !== false;
 }
 
+const CT_PARTS = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/Chicago', weekday: 'short', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+});
+
+/**
+ * The CME date (YYYY-MM-DD, America/Chicago) when `ms` falls in the daily
+ * recycle window, 16:05-16:54 CT Monday to Friday: CME Globex futures are
+ * halted 16:00-17:00 CT (from Friday 16:00 until Sunday 17:00), so no bar
+ * closes and nothing can fill. Otherwise null.
+ */
+export function cmeBreakDay(ms) {
+  const p = Object.fromEntries(CT_PARTS.formatToParts(new Date(ms)).map((x) => [x.type, x.value]));
+  if (!['Mon', 'Tue', 'Wed', 'Thu', 'Fri'].includes(p.weekday)) return null;
+  const minutes = Number(p.hour) * 60 + Number(p.minute);
+  if (minutes < 16 * 60 + 5 || minutes >= 16 * 60 + 55) return null;
+  return `${p.year}-${p.month}-${p.day}`;
+}
+
 export class LiveManager {
   constructor({ config, pool, streams = null, log = console, fetchImpl = fetch, warehouseImpl = warehouse }) {
     this.config = config;
@@ -76,6 +94,10 @@ export class LiveManager {
     // Intrabar: sessions whose symbol traded since their last run re-run on
     // the forming bar, throttled per session (see #maybeIntrabar).
     this.intrabarTimer = setInterval(() => this.#intrabarTick(), 1_000);
+    // Daily recycle in the CME break (config.dailyRecycle). Starting inside a
+    // break is a fresh start already: that day's recycle counts as done.
+    this.lastRecycleDay = cmeBreakDay(Date.now());
+    this.maintenanceTimer = setInterval(() => this.#maintenance(), 60_000);
     await this.sync();
   }
 
@@ -84,6 +106,7 @@ export class LiveManager {
     clearInterval(this.tickTimer);
     clearInterval(this.heartbeatTimer);
     clearInterval(this.intrabarTimer);
+    clearInterval(this.maintenanceTimer);
     clearTimeout(this.reloadTimer);
     this.feed.stop();
     await this.bus.stop();
@@ -110,6 +133,47 @@ export class LiveManager {
     for (const s of this.sessions.values()) {
       if (!s.lastPayload) continue;
       await this.bus.publishState({ ...s.lastPayload, ts: new Date().toISOString() });
+    }
+  }
+
+  async #maintenance(now = Date.now()) {
+    if (!this.config.dailyRecycle || this.recycling) return;
+    const day = cmeBreakDay(now);
+    if (!day || day === this.lastRecycleDay) return;
+    this.lastRecycleDay = day;
+    await this.recycle(`daily, CME break ${day}`);
+  }
+
+  async maintenanceForTest(now) { await this.#maintenance(now); }
+
+  /**
+   * Replace the stream and sandbox workers, then reopen every live session's
+   * stream from history right away (one at a time), so the sessions are warm
+   * before the market reopens instead of all reopening on its first print.
+   * Reopening from the same history gives the same ledger, so nothing is
+   * signalled (the same path a crashed stream worker takes).
+   */
+  async recycle(reason) {
+    if (this.recycling) return null;
+    this.recycling = true;
+    const t0 = Date.now();
+    try {
+      this.pool.recycle?.();
+      const closed = this.streams ? await this.streams.recycle() : 0;
+      let reopened = 0;
+      for (const s of this.sessions.values()) {
+        s.streamed = false;
+        if (!this.streams || s.streamOff || !s.bars.length) continue;
+        await this.#run(s);
+        if (s.streamed) reopened++;
+      }
+      this.log.info?.(`live: recycle (${reason}): ${closed} stream(s) closed, ${reopened} reopened from history in ${Date.now() - t0}ms`);
+      return { closed, reopened };
+    } catch (err) {
+      this.log.warn?.(`live: recycle (${reason}) failed: ${err.message}`);
+      return null;
+    } finally {
+      this.recycling = false;
     }
   }
 
