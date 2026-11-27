@@ -32,8 +32,9 @@ export class StreamHost {
   }
 
   #spawn() {
-    const child = fork(this.workerPath, [], { execArgv: ['--no-node-snapshot'], serialization: 'json', env: this.env });
-    const w = { child, ready: false, pending: new Map(), keys: new Set(), readyWaiters: [] };
+    // --expose-gc: the worker collects host garbage itself (worker.mjs).
+    const child = fork(this.workerPath, [], { execArgv: ['--no-node-snapshot', '--expose-gc'], serialization: 'json', env: this.env });
+    const w = { child, ready: false, pending: new Map(), keys: new Set(), readyWaiters: [], mem: null, retiring: false };
     // A send racing the worker's death fails with EPIPE; the exit handler
     // settles everything pending, so the error itself needs no handling.
     child.on('error', (err) => this.log.warn?.(`stream worker error: ${err.message}`));
@@ -43,6 +44,7 @@ export class StreamHost {
         for (const r of w.readyWaiters.splice(0)) r();
         return;
       }
+      if (msg && msg.mem) w.mem = msg.mem;
       const p = msg && w.pending.get(msg.id);
       if (!p) return;
       w.pending.delete(msg.id);
@@ -50,7 +52,9 @@ export class StreamHost {
       p.resolve(msg);
     });
     child.on('exit', (code, signal) => {
-      if (!this.closing) {
+      if (w.retiring) {
+        this.log.info?.('stream worker replaced (recycle)');
+      } else if (!this.closing) {
         this.crashes++;
         this.log.warn?.(`stream worker exited (code=${code} signal=${signal}); ${w.keys.size} stream(s) lost`);
       }
@@ -69,7 +73,7 @@ export class StreamHost {
 
   async #readyWorker(timeoutMs = 10_000) {
     const pick = () => {
-      const ready = this.workers.filter((x) => x.ready && x.child.connected);
+      const ready = this.workers.filter((x) => x.ready && !x.retiring && x.child.connected);
       if (!ready.length) return null;
       return ready.reduce((a, b) => (b.keys.size < a.keys.size ? b : a));
     };
@@ -149,6 +153,36 @@ export class StreamHost {
     return this.owner.has(key);
   }
 
+  /**
+   * Replace every stream worker (the daily recycle) or one (the memory
+   * watchdog). Its streams close; the live manager reopens those sessions from
+   * history. Resolves once the replacements are ready (or after `waitMs`).
+   * @returns {Promise<number>} streams that were closed
+   */
+  async recycle(which = null, { waitMs = 20_000 } = {}) {
+    if (this.closing) return 0;
+    let closed = 0;
+    for (const w of which ? [which] : [...this.workers]) {
+      if (w.retiring) continue;
+      w.retiring = true;
+      w.ready = false;
+      for (const key of w.keys) if (this.owner.get(key) === w) { this.owner.delete(key); closed++; }
+      w.keys.clear();
+      if (w.child.connected) w.child.disconnect();
+      setTimeout(() => { if (w.child.exitCode === null && w.child.signalCode === null) w.child.kill('SIGTERM'); }, 10_000).unref();
+    }
+    const deadline = Date.now() + waitMs;
+    while (Date.now() < deadline && this.workers.filter((x) => x.ready && !x.retiring).length < this.size) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return closed;
+  }
+
+  /** The worker using the most memory, from its last reply (or null). */
+  largest() {
+    return this.workers.filter((w) => w.mem && !w.retiring).sort((a, b) => b.mem.rss_mb - a.mem.rss_mb)[0] || null;
+  }
+
   get stats() {
     return {
       workers: this.workers.length,
@@ -157,6 +191,7 @@ export class StreamHost {
       maxStreams: this.maxStreams,
       pending: this.workers.reduce((n, w) => n + w.pending.size, 0),
       crashes: this.crashes,
+      memory: this.workers.map((w) => w.mem),
     };
   }
 

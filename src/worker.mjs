@@ -341,6 +341,21 @@ function symbolInfoFor(symbol, partial) {
   return merged;
 }
 
+// This process's memory, sent with every reply (the parent's watchdog and
+// memory log use it).
+function memory() {
+  const m = process.memoryUsage();
+  return { rss_mb: Math.round(m.rss / 1048576), external_mb: Math.round(m.external / 1048576), heap_mb: Math.round(m.heapUsed / 1048576) };
+}
+
+// Results copied out of the isolates are host garbage held as native
+// ("external") memory; the tiny host heap gives the GC little reason to run,
+// so collect once it builds up (config.gcExternalMb). Needs --expose-gc.
+const GC_EXTERNAL_BYTES = Math.max(8, config.gcExternalMb) * 1048576;
+function collectIfNeeded() {
+  if (typeof globalThis.gc === 'function' && process.memoryUsage().external > GC_EXTERNAL_BYTES) globalThis.gc();
+}
+
 process.on('message', async (job) => {
   let reply;
   try {
@@ -349,7 +364,8 @@ process.on('message', async (job) => {
   } catch (err) {
     reply = { ok: false, status: 500, detail: `worker failure: ${String(err?.message || err).slice(0, 300)}` };
   }
-  if (process.connected) process.send({ id: job.id, ...reply }, () => {});
+  collectIfNeeded();
+  if (process.connected) process.send({ id: job.id, ...reply, mem: memory() }, () => {});
 });
 
 process.on('disconnect', async () => {

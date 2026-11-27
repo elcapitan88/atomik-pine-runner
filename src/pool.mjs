@@ -17,20 +17,24 @@ export class WorkerPool {
   }
 
   #spawn() {
-    const child = fork(WORKER_PATH, [], { execArgv: ['--no-node-snapshot'], serialization: 'json' });
-    const w = { child, busy: null, ready: false };
+    // --expose-gc: the worker collects host garbage itself (worker.mjs).
+    const child = fork(WORKER_PATH, [], { execArgv: ['--no-node-snapshot', '--expose-gc'], serialization: 'json' });
+    const w = { child, busy: null, ready: false, mem: null, retiring: false };
     child.on('message', (msg) => {
       if (msg && msg.ready) { w.ready = true; this.#pump(); return; }
       if (w.busy && msg && msg.id === w.busy.id) {
         clearTimeout(w.busy.timer);
         const job = w.busy;
         w.busy = null;
+        if (msg.mem) w.mem = msg.mem;
         job.resolve(msg);
+        if (w.retiring) this.#retire(w);
         this.#pump();
       }
     });
     child.on('exit', (code, signal) => {
-      this.log.warn?.(`sandbox worker exited (code=${code} signal=${signal})`);
+      if (w.retiring) this.log.info?.('sandbox worker replaced (recycle)');
+      else this.log.warn?.(`sandbox worker exited (code=${code} signal=${signal})`);
       if (w.busy) {
         clearTimeout(w.busy.timer);
         w.busy.resolve({ id: w.busy.id, ok: false, status: 500, detail: 'sandbox worker crashed' });
@@ -42,9 +46,32 @@ export class WorkerPool {
     this.workers.push(w);
   }
 
+  // A retiring worker takes no new job; once idle it exits and the exit
+  // handler spawns its replacement.
+  #retire(w) {
+    w.retiring = true;
+    if (w.busy || !w.child.connected) return;
+    w.ready = false;
+    w.child.disconnect();
+    setTimeout(() => { if (w.child.exitCode === null && w.child.signalCode === null) w.child.kill('SIGTERM'); }, 10_000).unref();
+  }
+
+  /**
+   * Replace every worker (the daily recycle, or the memory watchdog with one
+   * worker). A busy worker finishes its job first; nothing queued is lost.
+   */
+  recycle(which = null) {
+    for (const w of which ? [which] : [...this.workers]) this.#retire(w);
+  }
+
+  /** The worker using the most memory, from its last reply (or null). */
+  largest() {
+    return this.workers.filter((w) => w.mem && !w.retiring).sort((a, b) => b.mem.rss_mb - a.mem.rss_mb)[0] || null;
+  }
+
   #pump() {
     while (this.queue.length) {
-      const w = this.workers.find((x) => x.ready && !x.busy);
+      const w = this.workers.find((x) => x.ready && !x.busy && !x.retiring);
       if (!w) return;
       const job = this.queue.shift();
       w.busy = job;
@@ -73,7 +100,10 @@ export class WorkerPool {
   }
 
   get stats() {
-    return { workers: this.workers.length, ready: this.workers.filter((w) => w.ready).length, busy: this.workers.filter((w) => w.busy).length, queued: this.queue.length };
+    return {
+      workers: this.workers.length, ready: this.workers.filter((w) => w.ready).length, busy: this.workers.filter((w) => w.busy).length, queued: this.queue.length,
+      memory: this.workers.map((w) => w.mem),
+    };
   }
 
   async close() {
