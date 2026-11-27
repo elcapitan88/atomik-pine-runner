@@ -99,6 +99,19 @@ references (`$.var.…`, `$$.let.…`).
     checked as before. Found live (Oct 7 2026): a strategy held a phantom position for three weeks
     and skipped every setup "in a trade".
 
+**`var` initializers**
+
+25. **A `var` initializer that calls a user function ran on every bar**: `var tbl = makeTable()` kept the
+    first table but called the function again on each bar and discarded the result, so its side effects
+    repeated (a new table, label or array element per bar; TradingView evaluates a `var` initializer on the
+    first bar only). PineTS deferred only built-in factories (`line.new`, `table.new`, ...) named directly in
+    the initializer. Now a user function call in the initializer, and the hoisted statements feeding it, move
+    into the thunk `initVar` runs once; a factory call passed to the function (`var l = keep(line.new(...))`)
+    is created inside it as a real object. An initializer containing `await` (`request.security`) is left
+    as it was. Found with MLExtensions' `var tbl = ml.init_table()` (Nov 27 2026): one table per bar made a
+    5,000-bar run take 14.6s instead of 1.0s. Every private-fixture script gives identical trades, plots and
+    drawings before and after.
+
 PineTS's own suite gives the same result with and without the patch (no new failures);
 `test/pinets-patches.test.mjs` pins the cases here.
 

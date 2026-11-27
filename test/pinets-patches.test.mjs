@@ -237,6 +237,27 @@ plot(na(e) and na(d) ? 1 : 0)`);
     expect(lastValue(r)).toBe(1);
   });
 
+  it('a var initializer that calls a user function runs on the first bar only', async () => {
+    // `var tbl = ml.init_table()` (MLExtensions) made a new table on every bar:
+    // the function ran each bar and only its result was discarded.
+    const r = await run(`//@version=6
+indicator("once", overlay=true, max_labels_count=500)
+var calls = array.new_int(0)
+record() =>
+    array.push(calls, 1)
+    array.size(calls)
+makeLabel() =>
+    label.new(bar_index, close, "made")
+var int first = record()
+var lb = makeLabel()
+label.set_xy(lb, bar_index, high)
+plot(array.size(calls), "calls")
+plot(first, "first")`);
+    expect(r.ok, r.error).toBe(true);
+    expect(r.series.plots.map((p) => p.values.at(-1))).toEqual([1, 1]);
+    expect(r.drawings.labels).toHaveLength(1);
+  });
+
   it('a one-off breakeven stop after a partial closes the runner', async () => {
     // Short 3 at 20000; 2 come off at 19995 on the entry bar; the script then
     // moves the runner's stop to breakeven ONCE. Price goes back up to 20010

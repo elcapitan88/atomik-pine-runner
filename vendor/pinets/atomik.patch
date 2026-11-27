@@ -1381,10 +1381,138 @@ index 1cb6768..20fc5c9 100644
          FunctionDeclaration(node: any, state: ScopeManager, c: any) {
              transformFunctionDeclaration(node, state, c);
 diff --git a/src/transpiler/transformers/StatementTransformer.ts b/src/transpiler/transformers/StatementTransformer.ts
-index cfc1576..b3da133 100644
+index cfc1576..b034fb3 100644
 --- a/src/transpiler/transformers/StatementTransformer.ts
 +++ b/src/transpiler/transformers/StatementTransformer.ts
-@@ -1044,6 +1044,17 @@ export function transformWhileStatement(node: any, scopeManager: ScopeManager, c
+@@ -16,6 +16,103 @@ import {
+     createScopedVariableAccess,
+ } from './ExpressionTransformer';
+ 
++// --- `var` initializers with user function calls ------------------------
++
++/** True when `pred` holds for `node` or any node below it (ignores parent links). */
++function containsNode(node: any, pred: (n: any) => boolean, seen: Set<any> = new Set()): boolean {
++    if (!node || typeof node !== 'object' || seen.has(node)) return false;
++    seen.add(node);
++    if (node.type && pred(node)) return true;
++    for (const key of Object.keys(node)) {
++        if (key === 'parent' || key === 'loc' || key === 'range') continue;
++        const v = node[key];
++        if (Array.isArray(v)) {
++            for (const item of v) if (containsNode(item, pred, seen)) return true;
++        } else if (v && typeof v === 'object' && containsNode(v, pred, seen)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++// `$.call(fn, id, ...args)`: a call to a user-defined function.
++const isUserFunctionCall = (n: any) =>
++    n.type === 'CallExpression' &&
++    n.callee?.type === 'MemberExpression' &&
++    !n.callee.computed &&
++    n.callee.object?.type === 'Identifier' &&
++    n.callee.object.name === CONTEXT_NAME &&
++    n.callee.property?.name === 'call';
++
++const declaredNames = (stmt: any): string[] =>
++    (stmt.declarations || []).filter((d: any) => d.id?.type === 'Identifier').map((d: any) => d.id.name);
++
++const referencesAny = (node: any, names: Set<string>) =>
++    names.size > 0 && containsNode(node, (n) => n.type === 'Identifier' && names.has(n.name));
++
++/**
++ * Moves a `var` initializer that calls a user function, with the hoisted
++ * statements it depends on, into `() => { ...; return init; }`. initVar
++ * evaluates a function source on the first bar only. Statements that feed only
++ * other expressions stay where they are; factory thunks the initializer uses
++ * are unwrapped inside it (it is already lazy). An initializer with `await`
++ * (request.security) is left as it was.
++ */
++function deferVarInitializer(decl: any, scopeManager: ScopeManager): void {
++    const hoisted: any[] = scopeManager.getCurrentHoistingScope() || [];
++    const candidates = hoisted.filter((s) => s.type === 'VariableDeclaration');
++    const moved = new Set<any>();
++    const names = new Set<string>();
++    const move = (s: any) => {
++        moved.add(s);
++        declaredNames(s).forEach((n) => names.add(n));
++    };
++    // Forward: statements that call a user function, then those using their results.
++    for (const s of candidates) {
++        if (containsNode(s, isUserFunctionCall) || referencesAny(s, names)) move(s);
++    }
++    if (!containsNode(decl.init, isUserFunctionCall) && !referencesAny(decl.init, names)) return;
++    // Backward: factory thunks the moved code or the initializer uses, and the
++    // statements that pass them along (`p = $.param(temp)` around `temp = () => line.new(...)`).
++    const factoryNames = new Set<string>();
++    const leadsToFactory = new Set<any>();
++    for (const s of candidates) {
++        if ((s.declarations || []).some((d: any) => d.init?._factoryThunk) || referencesAny(s, factoryNames)) {
++            leadsToFactory.add(s);
++            declaredNames(s).forEach((n) => factoryNames.add(n));
++        }
++    }
++    let grew = true;
++    while (grew) {
++        grew = false;
++        for (const s of candidates) {
++            if (moved.has(s) || !leadsToFactory.has(s)) continue;
++            const own = new Set(declaredNames(s));
++            if (referencesAny(decl.init, own) || [...moved].some((m) => referencesAny(m, own))) {
++                move(s);
++                grew = true;
++            }
++        }
++    }
++    const ordered = hoisted.filter((s) => moved.has(s));
++    if (containsNode(decl.init, (n) => n.type === 'AwaitExpression') || ordered.some((s) => containsNode(s, (n) => n.type === 'AwaitExpression'))) {
++        return;
++    }
++    for (const s of ordered) {
++        hoisted.splice(hoisted.indexOf(s), 1);
++        for (const d of s.declarations || []) {
++            if (d.init?._factoryThunk) d.init = d.init.body;
++        }
++    }
++    decl.init = {
++        type: 'ArrowFunctionExpression',
++        params: [],
++        async: false,
++        expression: false,
++        body: { type: 'BlockStatement', body: [...ordered, { type: 'ReturnStatement', argument: decl.init }] },
++    };
++}
++
+ /**
+  * Creates the AST nodes for a loop guard:
+  * 1. A counter declaration: `let __lgN = 0;` (to be hoisted before the loop)
+@@ -647,6 +744,7 @@ export function transformVariableDeclaration(varNode: any, scopeManager: ScopeMa
+                                     body: d.init,
+                                     expression: true,
+                                     async: false,
++                                    _factoryThunk: true,
+                                 };
+                             }
+                         }
+@@ -655,6 +753,15 @@ export function transformVariableDeclaration(varNode: any, scopeManager: ScopeMa
+             }
+         }
+ 
++        // A `var` initializer that calls a user function is evaluated on bar 0
++        // only, like TradingView: the call (and the hoisted statements that
++        // feed it) move into a thunk that initVar runs once. Without this the
++        // function ran on every bar and only its result was discarded, so its
++        // side effects repeated (`var tbl = makeTable()` made a table per bar).
++        if (kind === 'var' && decl.init && !isArrowFunction && !isArrayPatternVar) {
++            deferVarInitializer(decl, scopeManager);
++        }
++
+         // Prepare right side
+         let rightSide;
+         if (decl.init) {
+@@ -1044,6 +1151,17 @@ export function transformWhileStatement(node: any, scopeManager: ScopeManager, c
      }
  }
  
@@ -1402,7 +1530,7 @@ index cfc1576..b3da133 100644
  export function transformExpression(node: any, scopeManager: ScopeManager): void {
      walk.recursive(node, scopeManager, {
          MemberExpression(node: any, state: ScopeManager, c: any) {
-@@ -1057,6 +1068,14 @@ export function transformExpression(node: any, scopeManager: ScopeManager): void
+@@ -1057,6 +1175,14 @@ export function transformExpression(node: any, scopeManager: ScopeManager): void
                  node.object.parent = node;
                  c(node.object, state);
              }
@@ -1417,7 +1545,7 @@ index cfc1576..b3da133 100644
              transformMemberExpression(node, '', scopeManager);
          },
  
-@@ -1393,8 +1412,17 @@ export function transformReturnStatement(node: any, scopeManager: ScopeManager):
+@@ -1393,8 +1519,17 @@ export function transformReturnStatement(node: any, scopeManager: ScopeManager):
                              node._arrayAccessed = true;
                          }
                      },
@@ -1436,7 +1564,7 @@ index cfc1576..b3da133 100644
                      },
                      // When an arrow function's last statement is an assignment
                      // (e.g. `tracker.field := …`), the parser folds it into the
-@@ -1535,8 +1563,10 @@ export function transformFunctionDeclaration(node: any, scopeManager: ScopeManag
+@@ -1535,8 +1670,10 @@ export function transformFunctionDeclaration(node: any, scopeManager: ScopeManag
          node.params.forEach((param: any) => {
              if (param.type === 'Identifier') {
                  scopeManager.addLocalSeriesVar(param.name);
@@ -1447,7 +1575,7 @@ index cfc1576..b3da133 100644
              }
          });
  
-@@ -1570,7 +1600,7 @@ export function transformFunctionDeclaration(node: any, scopeManager: ScopeManag
+@@ -1570,7 +1707,7 @@ export function transformFunctionDeclaration(node: any, scopeManager: ScopeManag
          const savedStaticBindings: Record<string, string | undefined> = {};
          if (rawParamTypes) {
              for (const [paramName, typeName] of Object.entries(rawParamTypes)) {
@@ -2522,5 +2650,111 @@ index 0000000..fa56841
 +        const js = String(transpile(code));
 +        expect(js).toContain(', undefined, ');
 +        expect(js).not.toContain('$.get(undefined');
++    });
++});
+diff --git a/tests/transpiler/var-init-user-function-once.test.ts b/tests/transpiler/var-init-user-function-once.test.ts
+new file mode 100644
+index 0000000..40f6fc6
+--- /dev/null
++++ b/tests/transpiler/var-init-user-function-once.test.ts
+@@ -0,0 +1,100 @@
++import { describe, it, expect } from 'vitest';
++import { PineTS, Provider } from 'index';
++
++/**
++ * A `var` initializer is evaluated on the first bar only (TradingView). When it
++ * called a user-defined function, PineTS ran the function on every bar and only
++ * discarded the result, so the function's side effects repeated: a table,
++ * label or array element per bar (`var tbl = makeTable()` is how the popular
++ * MLExtensions library's stats table is created).
++ */
++describe('var initializer with a user function call runs once', () => {
++    const makePineTS = () =>
++        new PineTS(Provider.Mock, 'BTCUSDC', '60', null, new Date('2024-01-01').getTime(), new Date('2024-01-05').getTime());
++    const last = (plots: any, title: string) => plots[title].data[plots[title].data.length - 1].value;
++
++    it('calls the function once and keeps its first result', async () => {
++        const { plots } = await makePineTS().run(`
++//@version=6
++indicator("once")
++var calls = array.new_int(0)
++record() =>
++    array.push(calls, 1)
++    array.size(calls)
++var int first = record()
++var int plusOne = record() + 1
++plot(array.size(calls), "calls")
++plot(first, "first")
++plot(plusOne, "plusOne")
++`);
++        expect(last(plots, 'calls')).toBe(2);
++        expect(last(plots, 'first')).toBe(1);
++        expect(last(plots, 'plusOne')).toBe(3);
++    });
++
++    it('a drawing made inside the function exists once', async () => {
++        const { plots } = await makePineTS().run(`
++//@version=6
++indicator("once", overlay=true, max_labels_count=500)
++makeLabel() =>
++    label.new(bar_index, close, "made")
++makeTable() =>
++    table.new(position.top_right, 2, 2)
++var lb = makeLabel()
++var tbl = makeTable()
++label.set_xy(lb, bar_index, high)
++plot(close)
++`);
++        const labels = plots['__labels__'].data[0].value.filter((l: any) => !l._deleted);
++        expect(labels.length).toBe(1);
++        const tables = plots['__tables__'].data[0].value.filter((t: any) => !t._deleted);
++        expect(tables.length).toBe(1);
++    });
++
++    it('hoisted arguments and factory calls passed to the function are deferred too', async () => {
++        const { plots } = await makePineTS().run(`
++//@version=6
++indicator("once", overlay=true, max_lines_count=500)
++var calls = array.new_int(0)
++record() =>
++    array.push(calls, 1)
++    array.size(calls)
++keep(line ln) =>
++    ln
++var sizes = array.from(record(), 7)
++var line kept = keep(line.new(0, 1, 2, 3))
++plot(array.size(calls), "calls")
++plot(array.get(sizes, 0), "size0")
++plot(line.get_x2(kept), "x2")
++`);
++        expect(last(plots, 'calls')).toBe(1);
++        expect(last(plots, 'size0')).toBe(1);
++        expect(last(plots, 'x2')).toBe(2);
++        const lines = plots['__lines__'].data[0].value.filter((l: any) => !l._deleted);
++        expect(lines.length).toBe(1);
++    });
++
++    it('function-local var state still persists across bars', async () => {
++        const { plots } = await makePineTS().run(`
++//@version=6
++indicator("count")
++counter() =>
++    var int n = 0
++    n += 1
++    n
++start() =>
++    close
++var float s = start()
++plot(counter(), "n")
++plot(s, "s")
++plot(close, "c")
++`);
++        const n = plots['n'].data;
++        expect(n.length).toBeGreaterThan(50);
++        expect(n[n.length - 1].value).toBe(n.length);
++        // `s` keeps the first bar's close on every bar.
++        const first = plots['c'].data[0].value;
++        expect(plots['s'].data.every((d: any) => d.value === first)).toBe(true);
++        expect(plots['c'].data[n.length - 1].value).not.toBe(first);
 +    });
 +});
