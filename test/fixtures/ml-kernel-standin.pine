@@ -1,0 +1,42 @@
+//@version=6
+// Atomik's own stand-in for scripts built on jdehorty's libraries (tests only).
+strategy("Stand-in ML kernel strategy", overlay=true)
+import jdehorty/MLExtensions/2 as ml
+import jdehorty/KernelFunctions/2 as kernels
+import LuxSignals/FormattingUtils/3 as f
+
+sizeChoice = input.string("Small", "Label size", options=["Tiny", "Small", "Normal", "Large"])
+h = input.int(8, "Lookback")
+r = input.float(8.0, "Relative weight")
+x = input.int(25, "Start at bar")
+// a comment mentioning ml.normalize stays as it is
+note = "ml.n_rsi in a string stays too"
+
+rsiF = ml.n_rsi(close, 14, 1)
+wtF = ml.n_wt(hlc3, 10, 11)
+cciF = ml.n_cci(close, 20, 1)
+adxF = ml.n_adx(high, low, close, 20)
+yhat1 = kernels.rationalQuadratic(close, h, r, x)
+yhat2 = kernels.gaussian(close, h - 2, x)
+okVol = ml.filter_volatility(1, 10, true)
+okRegime = ml.regime_filter(ohlc4, -0.1, true)
+okAdx = ml.filter_adx(close, 14, 20, false)
+bull = ta.crossover(yhat2, yhat1)
+bear = ta.crossunder(yhat2, yhat1)
+if bull and okVol and okRegime and okAdx and rsiF < 0.7
+    strategy.entry("L", strategy.long)
+if bear
+    strategy.close("L")
+plot(rsiF, "rsiF")
+plot(wtF, "wtF")
+plot(cciF, "cciF")
+plot(adxF, "adxF")
+plot(yhat1, "yhat1", color=ml.color_green(5))
+plot(yhat2, "yhat2", color=ml.color_red(3))
+plot(ml.tanhTransform(close, 1, 5), "tanhT")
+[tw, tl, flips, tt, hdr, wlr, wr] = ml.backtest(high, low, open, bull, bear, bear, bull, false, 0, bar_index, close, false)
+plot(tt, "bt_trades")
+var tbl = ml.init_table()
+if barstate.islast
+    ml.update_table(tbl, hdr, tt, tw, tl, wlr, wr, flips)
+    label.new(bar_index, high, "last", size=f.textSizeFromChoice(sizeChoice))

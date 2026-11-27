@@ -1,0 +1,5 @@
+// Test library for test/imports.test.mjs (Atomik's own code): imports itself.
+//@version=6
+library("Loop")
+import acme/Loop/1 as again
+export f(float x) => again.f(x)

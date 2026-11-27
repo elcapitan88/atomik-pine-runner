@@ -7,6 +7,7 @@
 // the only way out is the host functions we hand in explicitly.
 import ivm from 'isolated-vm';
 import { readFileSync } from 'node:fs';
+import { expandImports } from './imports.mjs';
 
 // PineTS 0.10.0 + our transpiler fixes (vendor/pinets/README.md). Back to
 // node_modules/pinets once an upstream release carries them.
@@ -629,10 +630,22 @@ async function withDeadline(isolate, timeoutMs, fn) {
   }
 }
 
-function failure(out, isolate, bridge, logs, started) {
+function failure(out, isolate, bridge, logs, started, mapMessage = (m) => m) {
   const reason = bridge.error ? 'data' : out.timedOut ? 'timeout' : (isolate.isDisposed ? 'disposed' : 'error');
-  const error = bridge.error ? String(bridge.error.message || bridge.error) : String(out.err?.message || out.err);
+  const error = bridge.error ? String(bridge.error.message || bridge.error) : mapMessage(String(out.err?.message || out.err));
   return { ok: false, reason, error: error.slice(0, 500), ms: Math.round(performance.now() - started), logs, dataError: bridge.error || null };
+}
+
+// Pine `import` lines -> the libraries inlined (imports.mjs). A script without
+// imports passes through unchanged. An import that can't be resolved is a
+// script error with its line, before any isolate is made.
+function prepareSource(source, started) {
+  try {
+    return { prep: expandImports(source) };
+  } catch (err) {
+    if (!err || typeof err.line !== 'number') throw err;
+    return { fail: { ok: false, reason: 'error', error: String(err.message).slice(0, 500), ms: Math.round(performance.now() - started), logs: [], dataError: null } };
+  }
 }
 
 /**
@@ -651,6 +664,8 @@ function failure(out, isolate, bridge, logs, started) {
  */
 export async function runPine({ source, tickerId, timeframe, limit = null, sDate = null, eDate = null, symbolInfo, fetchBars, timeoutMs = 10_000, memoryMb = 128, maxPlotPoints = 3000, maxSeriesBars = 3000, inputs = null, liveAlerts = false }) {
   const started = performance.now();
+  const { prep, fail } = prepareSource(source, started);
+  if (fail) return fail;
   const logs = [];
   const bridge = { fetchBars, error: null };
   const isolate = new ivm.Isolate({ memoryLimit: memoryMb });
@@ -659,12 +674,12 @@ export async function runPine({ source, tickerId, timeframe, limit = null, sDate
     const out = await withDeadline(isolate, timeoutMs, async () => {
       const context = await prepareContext(isolate, logs, bridge);
       setupMs = performance.now() - started;
-      return context.evalClosure(RUN_CLOSURE, [source, JSON.stringify({ tickerId, timeframe, limit, sDate, eDate, symbolInfo, maxPlotPoints, maxSeriesBars, inputs, liveAlerts })], {
+      return context.evalClosure(RUN_CLOSURE, [prep.source, JSON.stringify({ tickerId, timeframe, limit, sDate, eDate, symbolInfo, maxPlotPoints, maxSeriesBars, inputs, liveAlerts })], {
         arguments: { copy: true },
         result: { promise: true, copy: true },
       });
     });
-    if (out.err) return failure(out, isolate, bridge, logs, started);
+    if (out.err) return failure(out, isolate, bridge, logs, started, prep.mapMessage);
     return { ok: true, ms: Math.round(performance.now() - started), setupMs: Math.round(setupMs), logs, ...JSON.parse(out.value) };
   } finally {
     if (!isolate.isDisposed) isolate.dispose();
@@ -683,33 +698,36 @@ export async function runPine({ source, tickerId, timeframe, limit = null, sDate
  * reopens from history.
  */
 export class PineStream {
-  constructor(isolate, context, bridge, logs) {
+  constructor(isolate, context, bridge, logs, mapMessage = (m) => m) {
     this.isolate = isolate;
     this.context = context;
     this.bridge = bridge;
     this.logs = logs;
+    this.mapMessage = mapMessage;
   }
 
   /** Same arguments and result fields as runPine, plus `stream` on success. */
   static async open({ source, tickerId, timeframe, limit = null, symbolInfo, fetchBars, timeoutMs = 20_000, memoryMb = 256, maxPlotPoints = 400, maxSeriesBars = 3000, maxClosedTrades = 0, inputs = null, liveAlerts = false }) {
     const started = performance.now();
+    const { prep, fail } = prepareSource(source, started);
+    if (fail) return fail;
     const logs = [];
     const bridge = { fetchBars, error: null };
     const isolate = new ivm.Isolate({ memoryLimit: memoryMb });
     const out = await withDeadline(isolate, timeoutMs, async () => {
       const context = await prepareContext(isolate, logs, bridge);
-      const json = await context.evalClosure(STREAM_OPEN, [source, JSON.stringify({ tickerId, timeframe, limit, symbolInfo, maxPlotPoints, maxSeriesBars, maxClosedTrades, inputs, liveAlerts })], {
+      const json = await context.evalClosure(STREAM_OPEN, [prep.source, JSON.stringify({ tickerId, timeframe, limit, symbolInfo, maxPlotPoints, maxSeriesBars, maxClosedTrades, inputs, liveAlerts })], {
         arguments: { copy: true },
         result: { promise: true, copy: true },
       });
       return { context, json };
     });
     if (out.err) {
-      const f = failure(out, isolate, bridge, logs, started);
+      const f = failure(out, isolate, bridge, logs, started, prep.mapMessage);
       if (!isolate.isDisposed) isolate.dispose();
       return f;
     }
-    const stream = new PineStream(isolate, out.value.context, bridge, logs);
+    const stream = new PineStream(isolate, out.value.context, bridge, logs, prep.mapMessage);
     return { ok: true, stream, ms: Math.round(performance.now() - started), logs, ...JSON.parse(out.value.json) };
   }
 
@@ -735,7 +753,7 @@ export class PineStream {
       result: { promise: true, copy: true },
     }));
     if (out.err) {
-      const f = failure(out, this.isolate, this.bridge, this.logs, started);
+      const f = failure(out, this.isolate, this.bridge, this.logs, started, this.mapMessage);
       this.dispose();
       return f;
     }

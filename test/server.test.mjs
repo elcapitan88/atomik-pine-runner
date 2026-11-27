@@ -99,6 +99,18 @@ hline(70, "hi")`;
     expect(j.errors[0].line).toBe(3);
     expect(j.errors[0].message).toMatch(/Unexpected token/);
   });
+  it('a script that imports Pine libraries compiles', async () => {
+    const source = '//@version=6\nstrategy("Kernel cross")\nimport jdehorty/KernelFunctions/2 as kernels\nimport jdehorty/MLExtensions/2 as ml\n'
+      + 'fast = kernels.gaussian(close, 6, 25)\nslow = kernels.rationalQuadratic(close, 8, 8.0, 25)\n'
+      + 'if ta.crossover(fast, slow) and ml.n_rsi(close, 14, 1) < 0.8\n    strategy.entry("L", strategy.long)\nif ta.crossunder(fast, slow)\n    strategy.close("L")\nplot(fast)\n';
+    const j = await (await post('/v1/compile', { source })).json();
+    expect(j).toMatchObject({ ok: true, kind: 'strategy', title: 'Kernel cross', errors: [] });
+  });
+  it('an import Atomik does not have is a compile error on its line', async () => {
+    const j = await (await post('/v1/compile', { source: '//@version=6\nindicator("t")\nimport someone/Missing/1 as m\nplot(m.f(close))\n' })).json();
+    expect(j.ok).toBe(false);
+    expect(j.errors[0]).toEqual({ line: 3, message: 'The Pine library someone/Missing/1 is not available on Atomik yet (at 3:1)' });
+  });
   it('unknown function is a runtime error', async () => {
     const j = await (await post('/v1/compile', { source: SCRIPTS.bad_function })).json();
     expect(j.ok).toBe(false);
