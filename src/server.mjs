@@ -7,6 +7,7 @@ import Fastify from 'fastify';
 import { config } from './config.mjs';
 import { requireServiceKey } from './auth.mjs';
 import { WorkerPool } from './pool.mjs';
+import { MemoryWatchdog, memorySnapshot, memoryLine } from './memory.mjs';
 import { SUPPORTED_TIMEFRAMES } from './timeframes.mjs';
 import { tickerToRoot } from './symbols.mjs';
 import * as warehouse from './warehouse.mjs';
@@ -32,12 +33,20 @@ if (liveConfigured) {
   app.log.warn('live chart indicators disabled (DATAHUB_WS_URL, DATAHUB_API_KEY, REDIS_URL needed)');
 }
 
+// Memory: a log line every few minutes, and the watchdog (src/memory.mjs).
+const watchdog = new MemoryWatchdog({ pool, streams, budgetMb: config.memoryBudgetMb, log: app.log });
+const watchdogTimer = setInterval(() => watchdog.check().catch((err) => app.log.warn(`memory watchdog: ${err.message}`)), 30_000);
+const memoryLogTimer = setInterval(() => app.log.info(memoryLine(memorySnapshot({ pool, streams }), config.memoryBudgetMb)), Math.max(1, config.memoryLogMinutes) * 60_000);
+watchdogTimer.unref();
+memoryLogTimer.unref();
+
 app.get('/health', async () => ({
   ok: true,
   runtime: 'pinets',
   warehouse: await warehouse.ping(),
   pool: pool.stats,
   live: live ? live.stats : null,
+  memory: { ...memorySnapshot({ pool, streams }), budget_mb: config.memoryBudgetMb, watchdog_actions: watchdog.actions },
 }));
 
 // Script input overrides ({in_N: value}) from the settings dialog: a small map
@@ -128,6 +137,8 @@ async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   app.log.info(`${signal}: shutting down`);
+  clearInterval(watchdogTimer);
+  clearInterval(memoryLogTimer);
   await app.close();
   if (live) await live.stop();
   if (streams) await streams.close();

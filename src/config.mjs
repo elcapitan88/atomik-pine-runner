@@ -62,6 +62,22 @@ export const config = {
   // Reopen a stream from history once it has grown this many bars past the
   // warmup, so its memory stays bounded.
   liveStreamRecycleBars: int('PINE_LIVE_STREAM_RECYCLE_BARS', 2000),
+  // Memory. Every isolate result is copied into the worker process as native
+  // memory the host GC counts as "external"; the host heap is tiny, so the GC
+  // rarely ran and that memory piled up until the container's limit killed the
+  // stream worker (Nov 5, 13 and 24 2026). Workers now collect once external
+  // memory passes PINE_GC_EXTERNAL_MB.
+  gcExternalMb: int('PINE_GC_EXTERNAL_MB', 64),
+  // Once a day in the CME daily break (16:05-16:55 America/Chicago) the stream
+  // and sandbox workers are replaced and every live session reopens from
+  // history, so a long-lived stream (a 30m session takes ~41 days to reach the
+  // bar-count recycle above) never accumulates memory for weeks.
+  dailyRecycle: (env.PINE_DAILY_RECYCLE || 'true') === 'true',
+  // Watchdog: when the runner's processes together pass this many MB, the
+  // largest worker is replaced in a controlled way (before the container's
+  // out-of-memory kill takes the stream worker and everything in it).
+  memoryBudgetMb: int('PINE_MEMORY_BUDGET_MB', 3400),
+  memoryLogMinutes: int('PINE_MEMORY_LOG_MINUTES', 10),
   liveSyncSeconds: int('PINE_LIVE_SYNC_SECONDS', 30),
   liveRunTimeoutMs: int('PINE_LIVE_RUN_TIMEOUT_MS', 20_000),
   // Re-publish unchanged state this often so a chart opened between bar closes

@@ -78,6 +78,10 @@ HTTP request ─▶ server.mjs (auth, validation) ─▶ pool.mjs ─▶ worker.
 | `PINE_MAX_STREAMS` | `8` | open streams (~40MB each); sessions beyond it use full re-runs |
 | `PINE_LIVE_STREAM_INTRABAR_MS` | `1000` | min ms between forming-bar updates of a streamed session |
 | `PINE_LIVE_STREAM_RECYCLE_BARS` | `2000` | reopen a stream from history once it grew this many bars past the warmup |
+| `PINE_DAILY_RECYCLE` | `true` | once a day in the CME break (16:05–16:55 CT, Mon–Fri) replace the stream and sandbox workers and reopen every session from history (see "Memory") |
+| `PINE_MEMORY_BUDGET_MB` | `3400` | when all processes together pass this, the largest worker is replaced in a controlled way |
+| `PINE_MEMORY_LOG_MINUTES` | `10` | how often the `memory:` log line is written |
+| `PINE_GC_EXTERNAL_MB` | `64` | a worker runs the host GC once its external memory (results copied out of isolates) passes this |
 | `PINE_LIVE_INTRABAR_SECONDS` | `5` | min seconds between forming-bar re-runs of a NON-streamed session (trading sessions drop to 1s only while an order can fill mid-bar) |
 | `PINE_LIVE_HEARTBEAT_SECONDS` | `60` | full-state re-publish so open charts catch up |
 | `PINE_RICH_DRAWINGS` | `false` | send `box.new`/`line.new`/`label.new` objects with their full style (`kind: 'box' \| 'line' \| 'label'`, see `src/live/state.mjs`); off = plain boxes, with horizontal lines and labels as price levels. Turn on only once the chart draws the new kinds |
@@ -152,6 +156,26 @@ Any stream failure disposes the stream (its state is not trustworthy after a bar
 the session reopens it from history; a session whose stream fails 3 times on its own, or that
 finds no stream capacity, falls back to full re-runs. `/health` shows `live.streams` and each
 session's `stream` block (opens, bars, heap).
+
+## Memory
+
+In November 2026 the runner's memory climbed about 0.1–0.2 GB a day until the container's 4 GB limit
+killed the stream worker (Nov 5, Nov 13 and Nov 24, the last during market hours), dropping every live
+session at once; they reopened from history. Now:
+
+- **Daily recycle.** In the CME daily break (16:05–16:55 CT, Monday to Friday, when futures are halted)
+  the stream and sandbox workers are replaced and every session's stream is reopened from history right
+  away, one at a time, so the sessions are warm before the 17:00 open. Reopening from the same history
+  gives the same ledger, so nothing is signalled. A busy sandbox worker finishes its job first.
+- **Watchdog.** Every 30 seconds the processes' memory is summed (each worker reports its own with every
+  reply); above `PINE_MEMORY_BUDGET_MB` the largest worker is replaced (at most every 15 minutes). A
+  replaced stream worker's sessions reopen from history on their next update, the same as after a crash,
+  but without the out-of-memory kill taking the sandbox workers with it.
+- **Host GC.** Workers run with `--expose-gc` and collect once external memory passes
+  `PINE_GC_EXTERNAL_MB`; `MALLOC_ARENA_MAX=2` (Dockerfile) keeps freed isolate memory from staying
+  in per-thread arenas.
+- **Visibility.** A `memory:` log line every `PINE_MEMORY_LOG_MINUTES` (total, main process, each
+  sandbox and stream worker's RSS / external memory, open streams), and the same under `memory` in `/health`.
 
 ## Development
 
