@@ -24,16 +24,23 @@ describe('sandbox runs PineTS', () => {
   });
 
   it('exit orders keep from_entry + tick offsets (live trading builds brackets from them)', async () => {
+    // Short brackets close the early trades; one late entry with a wide bracket
+    // is still open on the last bar, with its exit resting (PineTS >= 0.12, like
+    // TradingView, cancels a flat position's exits, so only an open trade has one).
     const src = `//@version=6
 strategy("Bracket", overlay=true, pyramiding=0)
-if bar_index % 50 == 0
+if bar_index % 50 == 0 and bar_index < 1900
     strategy.entry("L", strategy.long)
-strategy.exit("LX", from_entry="L", profit=40, loss=20)`;
+strategy.exit("LX", from_entry="L", profit=40, loss=20)
+if bar_index == 1950
+    strategy.entry("L2", strategy.long)
+strategy.exit("LX2", from_entry="L2", profit=40000, loss=20000)`;
     const r = await run(src);
-    expect(r.ok).toBe(true);
-    const ex = r.strategy.pending_orders.find((o) => o.category === 'exit');
+    expect(r.ok, r.error).toBe(true);
+    const ex = r.strategy.pending_orders.find((o) => o.category === 'exit' && o.status === 'pending');
     expect(ex).toBeTruthy();
-    expect(ex).toMatchObject({ id: 'LX', from_entry: 'L', profit: 40, loss: 20, status: 'pending' });
+    expect(ex).toMatchObject({ id: 'LX2', from_entry: 'L2', profit: 40000, loss: 20000, status: 'pending' });
+    expect(r.strategy.opentrades.map((o) => o.entry_id)).toEqual(['L2']);
     const t = r.strategy.closedtrades[0];
     expect(t.entry_id).toBe('L');
     expect(t.exit_id).toBe('LX');
@@ -80,13 +87,16 @@ describe('sandbox holds', () => {
   it('process.env is not readable', async () => {
     const r = await run(SCRIPTS.probe_env_read, { timeoutMs: 5000 });
     expect(r.ok).toBe(false);
-    expect(r.error).toMatch(/process is not defined/);
+    // PineTS >= 0.14 refuses the unknown identifier at compile time.
+    expect(r.error).toMatch(/process is not defined|Undeclared identifier "process"/);
   });
 
   it('no Node or web globals', async () => {
+    // PineTS >= 0.14 checks generated code against a closed world and may
+    // refuse a JS-mode script outright; if it runs, it sees no host globals.
     const r = await run(SCRIPTS.probe_js_mode, { timeoutMs: 5000 });
-    expect(r.ok).toBe(true);
-    expect(r.probe).toBe('undefined,undefined,undefined,undefined,undefined');
+    if (r.ok) expect(r.probe).toBe('undefined,undefined,undefined,undefined,undefined');
+    else expect(r.error).toMatch(/Undeclared identifier|not defined|version marker required/);
   });
 
   it('raw JS infinite loop is stopped', async () => {

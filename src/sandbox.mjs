@@ -9,7 +9,7 @@ import ivm from 'isolated-vm';
 import { readFileSync } from 'node:fs';
 import { expandImports } from './imports.mjs';
 
-// PineTS 0.10.0 + our transpiler fixes (vendor/pinets/README.md). Back to
+// PineTS 0.14.0 + our fixes (vendor/pinets/README.md). Back to
 // node_modules/pinets once an upstream release carries them.
 const BUNDLE_PATH = new URL('../vendor/pinets/pinets.min.browser.js', import.meta.url);
 const BUNDLE_SOURCE = readFileSync(BUNDLE_PATH, 'utf8');
@@ -28,8 +28,75 @@ globalThis.console = {
   error: (...a) => __hostLog.applyIgnored(undefined, ['error', a.map(String).join(' ')]),
   debug: () => {},
 };
-globalThis.setTimeout = (fn, _ms, ...args) => { Promise.resolve().then(() => fn(...args)); return 0; };
+// Short waits (PineTS's live-mode throttle, <= 1s) resolve at once, as they
+// always have here. Longer timers are deadlines (a provider request's abort
+// timer): they never fire; the host's wall-clock limit ends a run instead.
+let __timerId = 0;
+globalThis.setTimeout = (fn, ms, ...args) => {
+  const id = ++__timerId;
+  if (!(Number(ms) > 1000)) Promise.resolve().then(() => fn(...args));
+  return id;
+};
 globalThis.clearTimeout = () => {};
+// PineTS 0.14 creates an AbortController per run (its execution budget aborts
+// provider calls through it) and counts source bytes with TextEncoder.
+class __AbortSignal {
+  constructor() { this.aborted = false; this.reason = undefined; this.onabort = null; this.__listeners = []; }
+  addEventListener(type, fn, opts) { if (type === 'abort') this.__listeners.push({ fn, once: !!(opts && opts.once) }); }
+  removeEventListener(type, fn) { if (type === 'abort') this.__listeners = this.__listeners.filter((l) => l.fn !== fn); }
+  throwIfAborted() { if (this.aborted) throw this.reason; }
+}
+globalThis.AbortSignal = __AbortSignal;
+globalThis.AbortController = class AbortController {
+  constructor() { this.signal = new __AbortSignal(); }
+  abort(reason) {
+    const s = this.signal;
+    if (s.aborted) return;
+    s.aborted = true;
+    s.reason = reason === undefined ? new Error('This operation was aborted') : reason;
+    const ls = s.__listeners;
+    s.__listeners = ls.filter((l) => !l.once);
+    for (const l of ls) l.fn.call(s, { type: 'abort', target: s });
+    if (typeof s.onabort === 'function') s.onabort({ type: 'abort', target: s });
+  }
+};
+globalThis.TextEncoder = class TextEncoder {
+  get encoding() { return 'utf-8'; }
+  encode(str = '') {
+    const s = String(str);
+    const out = [];
+    for (let i = 0; i < s.length; i++) {
+      let c = s.charCodeAt(i);
+      if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+        const d = s.charCodeAt(i + 1);
+        if (d >= 0xdc00 && d <= 0xdfff) { c = 0x10000 + ((c - 0xd800) << 10) + (d - 0xdc00); i++; }
+      }
+      if (c < 0x80) out.push(c);
+      else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+      else if (c < 0x10000) out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+      else out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+    }
+    return new Uint8Array(out);
+  }
+};
+globalThis.TextDecoder = class TextDecoder {
+  get encoding() { return 'utf-8'; }
+  decode(bytes) {
+    if (!bytes) return '';
+    const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes.buffer || bytes);
+    let out = '';
+    for (let i = 0; i < b.length; i++) {
+      const x = b[i];
+      let c;
+      if (x < 0x80) c = x;
+      else if (x < 0xe0) c = ((x & 31) << 6) | (b[++i] & 63);
+      else if (x < 0xf0) c = ((x & 15) << 12) | ((b[++i] & 63) << 6) | (b[++i] & 63);
+      else c = ((x & 7) << 18) | ((b[++i] & 63) << 12) | ((b[++i] & 63) << 6) | (b[++i] & 63);
+      out += String.fromCodePoint(c);
+    }
+    return out;
+  }
+};
 `;
 
 // Isolate-side helpers, installed once per isolate after the bundle. Every
@@ -38,6 +105,17 @@ const HELPERS = `
 // PineTS never settles if a provider call rejects (the constructor's ready
 // promise has no catch), so the provider must never reject: it records the
 // failure on \`state\`, hands back no bars, and the caller raises it after.
+// PineTS 0.14's execution budget (loop iterations, work units, memory charges,
+// provider calls) is shared by a whole run, and a stream is ONE run that lasts
+// for days: its default limits would end a heavy script (a kNN loop over 2,000
+// bars is ~10M iterations per 5,000 bars) or any long-lived stream. Here every
+// limit is lifted; the isolate's memory limit and the host's wall clock bound a
+// run, as they always have.
+globalThis.__budget = () => {
+  const MAX = Number.MAX_SAFE_INTEGER;
+  return { executionBudget: new PineTSLib.ExecutionBudget(MAX, { maxWorkUnits: MAX, maxMemoryBytes: MAX, maxProviderCalls: MAX, maxProviderPages: MAX, maxProviderRawBars: MAX, maxProviderResponseBytes: MAX, maxBars: MAX, maxFunctionCalls: MAX }) };
+};
+
 globalThis.__makeProvider = (state, opts) => ({
   async getMarketData(tickerId, timeframe, limit, sDate, eDate) {
     try {
@@ -138,15 +216,32 @@ globalThis.__deepSnapshot = (ctx) => {
   // numbers in ctx.cache; the secondaries themselves are rebuilt per update.
   const prims = {};
   for (const k in ctx.cache || {}) { const v = ctx.cache[k]; if (v === null || typeof v !== 'object') prims[k] = v; }
-  return { saved, cache: ctx.cache || null, prims };
+  // PineTS 0.14 numbers drawings from module-level counters: a drawing made by
+  // a discarded tick must not use up an id (ids would drift from a one-shot run).
+  const ids = typeof PineTSLib.snapshotDrawingIds === 'function' ? PineTSLib.snapshotDrawingIds() : null;
+  return { saved, cache: ctx.cache || null, prims, ids };
 };
 globalThis.__deepRestore = (snap) => {
+  if (snap.ids && typeof PineTSLib.restoreDrawingIds === 'function') PineTSLib.restoreDrawingIds(snap.ids);
   if (snap.cache) {
     for (const k in snap.cache) { const v = snap.cache[k]; if ((v === null || typeof v !== 'object') && !(k in snap.prims)) delete snap.cache[k]; }
     Object.assign(snap.cache, snap.prims);
   }
-  for (const [o, s] of snap.saved) {
+  // Children first (the reverse of the order they were found in): PineTS 0.14
+  // guards a matrix with a Proxy that COPIES a row assigned into it, so a
+  // matrix's rows must hold their restored values before the row list is
+  // rebuilt, or the copies keep the discarded tick's values.
+  const entries = [...snap.saved];
+  for (let e = entries.length - 1; e >= 0; e--) {
+    const [o, s] = entries[e];
     if (Array.isArray(o)) {
+      // Unchanged (same length, same elements): leave it, so a guarded matrix
+      // isn't rebuilt on every tick.
+      if (o.length === s.length) {
+        let same = true;
+        for (let i = 0; i < s.length; i++) if (o[i] !== s[i]) { same = false; break; }
+        if (same) continue;
+      }
       o.length = 0;
       for (let i = 0; i < s.length; i++) o.push(s[i]);
     } else if (o instanceof Map) {
@@ -240,7 +335,12 @@ globalThis.__installDeepRollback = (PineTSClass) => {
       if (!this.data || this.data.length === 0 || Array.isArray(this.source)) return false;
       const { newCandles, updatedLastCandle } = await this._updateMarketData();
       if (newCandles === 0 && !updatedLastCandle) return false;
+      // The rebuild re-runs the script over the secondary's history; drawings it
+      // makes there must not use up ids (PineTS 0.14's counters are module-wide),
+      // or the main script's later drawings get different ids than a one-shot run.
+      const ids = typeof PineTSLib.snapshotDrawingIds === 'function' ? PineTSLib.snapshotDrawingIds() : null;
       const fresh = await this.runPretranspiled(this._transpiledCode, context.inputs || {});
+      if (ids) PineTSLib.restoreDrawingIds(ids);
       for (const k of Object.keys(context)) delete context[k];
       Object.assign(context, fresh);
       return true;
@@ -285,9 +385,11 @@ globalThis.__extract = (ctx, source, opts) => {
     // chart keys drawings by creation bar + order instead. The plot copies
     // drop _createdAtBar; the helpers hold the live objects.
     const born = { boxes: new Map(), lines: new Map(), labels: new Map() };
+    // A helper holds its objects in an array (PineTS 0.10) or a DrawingStore (0.14: values()).
+    const liveObjects = (x) => (Array.isArray(x) ? x : x && typeof x.values === 'function' ? Array.from(x.values()) : []);
     for (const h of ctx._drawingHelpers || []) {
       for (const [k, arr] of [['boxes', h && h._boxes], ['lines', h && h._lines], ['labels', h && h._labels]]) {
-        if (Array.isArray(arr)) for (const o of arr) if (o && isNum(o._createdAtBar)) born[k].set(o.id, o._createdAtBar);
+        for (const o of liveObjects(arr)) if (o && isNum(o._createdAtBar)) born[k].set(o.id, o._createdAtBar);
       }
     }
     const bornAt = (kind, o) => { const i = born[kind].get(o.id); return isNum(i) && i >= 0 && i < n ? md[i].openTime : null; };
@@ -508,7 +610,7 @@ const source = $0;
 const opts = JSON.parse($1);
 const state = { dataError: null };
 return (async () => {
-  const pine = new PineTS(__makeProvider(state, opts), opts.tickerId, opts.timeframe, opts.limit ?? undefined, opts.sDate ?? undefined, opts.eDate ?? undefined);
+  const pine = new PineTS(__makeProvider(state, opts), opts.tickerId, opts.timeframe, opts.limit ?? undefined, opts.sDate ?? undefined, opts.eDate ?? undefined, __budget());
   // Live runs: alerts on every bar (the session keeps only new, live ones).
   // PineTS's default 'realtime' mode only fires on the LAST bar, which misses
   // alert.freq_once_per_bar_close when the close is seen with the next bar.
@@ -542,7 +644,7 @@ return (async () => {
   let r;
   try {
     __installDeepRollback(PineTS);
-    S.pine = new PineTS(__makeProvider(S.state, opts), opts.tickerId, opts.timeframe, opts.limit ?? undefined);
+    S.pine = new PineTS(__makeProvider(S.state, opts), opts.tickerId, opts.timeframe, opts.limit ?? undefined, undefined, undefined, __budget());
     if (opts.liveAlerts) S.pine.setAlertMode('all');
     S.ind = __indicatorFor(source, opts.inputs);
     S.it = S.pine.run(S.ind, undefined, 1e9);

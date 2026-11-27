@@ -39,7 +39,8 @@ check('request.security 60 + 240 via host provider', r.mtf_security.ok && count(
 check('box drawings come back', r.fvg_boxes.ok && r.fvg_boxes.drawings.boxes.length > 0, `boxes=${r.fvg_boxes.drawings?.boxes.length}`);
 check('v6 types/maps/while', r.v6_types_maps_while.ok, r.v6_types_maps_while.error || 'ok');
 check('process.env NOT readable', !r.probe_env_read.ok, r.probe_env_read.error || 'readable!');
-check('no Node/web globals in isolate', r.probe_js_mode.ok && r.probe_js_mode.probe === 'undefined,undefined,undefined,undefined,undefined', `probe=${r.probe_js_mode.probe} ${r.probe_js_mode.error || ''}`);
+// PineTS >= 0.14 refuses a JS-mode script outright (closed world); if one runs, it sees no host globals.
+check('no Node/web globals in isolate', r.probe_js_mode.ok ? r.probe_js_mode.probe === 'undefined,undefined,undefined,undefined,undefined' : /Undeclared identifier|not defined|version marker required/.test(r.probe_js_mode.error || ''), `probe=${r.probe_js_mode.probe} ${r.probe_js_mode.error || ''}`);
 check('raw JS infinite loop stopped', !r.probe_js_infinite_loop.ok && r.probe_js_infinite_loop.ms < 8_000, `reason=${r.probe_js_infinite_loop.reason} ms=${r.probe_js_infinite_loop.ms}`);
 if (r.probe_pine_nested_loops) {
   check('Pine nested loops killed by wall-clock timeout', r.probe_pine_nested_loops.reason === 'timeout' && r.probe_pine_nested_loops.ms < 8_000, `reason=${r.probe_pine_nested_loops.reason} ms=${r.probe_pine_nested_loops.ms}`);

@@ -123,7 +123,7 @@ hline(70, "hi")`;
   it('sandboxed: process.env read fails cleanly', async () => {
     const j = await (await post('/v1/compile', { source: SCRIPTS.probe_env_read })).json();
     expect(j.ok).toBe(false);
-    expect(j.errors[0].message).toMatch(/process is not defined/);
+    expect(j.errors[0].message).toMatch(/process is not defined|Undeclared identifier "process"/);
   });
 });
 
