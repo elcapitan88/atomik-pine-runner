@@ -48,6 +48,10 @@ HTTP request ─▶ server.mjs (auth, validation) ─▶ pool.mjs ─▶ worker.
   standard PineTS provider interface, so `request.security()` works for any timeframe the
   warehouse serves.
 - `//@PineTS` JavaScript mode is refused; only Pine Script v5/v6 with a `//@version` header is accepted.
+- `import <owner>/<Library>/<version> as <alias>` works for the libraries in `pine-libs/` (PineTS itself has no
+  library support): `src/imports.mjs` inlines them before the script runs and maps error lines back. Which
+  libraries are there, where each came from and its license: `pine-libs/README.md`. Any other import is a
+  compile error on its line.
 
 ## Configuration
 

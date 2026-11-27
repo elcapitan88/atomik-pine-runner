@@ -10,6 +10,8 @@ RUN npm ci --omit=dev && npm cache clean --force
 COPY src ./src
 # Patched PineTS bundle the sandbox loads (vendor/pinets/README.md).
 COPY vendor ./vendor
+# Pine libraries scripts can `import` (pine-libs/README.md).
+COPY pine-libs ./pine-libs
 
 RUN useradd --create-home appuser
 USER appuser

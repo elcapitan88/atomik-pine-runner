@@ -1,0 +1,39 @@
+// Test library for test/imports.test.mjs (Atomik's own code).
+//@version=6
+library("Util", overlay = true)
+import acme/Base/1 as base
+
+SCALE = 3.0
+UNUSED = 99
+
+export type Point
+    float price
+    int idx
+
+export enum Side
+    long = "Long"
+    short = "Short"
+
+helper(float x) =>
+    x * SCALE
+
+export scaled(float x) =>
+    helper(x)
+
+export twice(float x) =>
+    base.double(x)
+
+export method bump(Point p, float amount) =>
+    p.price := p.price + amount
+    p
+
+export counter() =>
+    var int n = 0
+    n += 1
+    n
+
+export sideName(Side s) =>
+    str.tostring(s)
+
+// Example code: dropped when the library is imported.
+plot(scaled(close), "example")

@@ -1,0 +1,18 @@
+// Atomik's own stand-in for the import path `LuxSignals/FormattingUtils/3`.
+// Written by Atomik Trading from the described behaviour of `textSizeFromChoice`.
+// It is not LuxSignals' code and contains none of it. Only `textSizeFromChoice` is provided.
+// Part of atomik-pine-runner, licensed under the GNU Affero General Public License v3.0.
+//@version=6
+
+library("FormattingUtils")
+
+// @function Maps a text-size choice from a settings dropdown to a size constant.
+// @param choice "Tiny", "Small", "Normal" or "Large". Anything else gives size.normal.
+// @returns The matching size.* constant.
+export textSizeFromChoice(string choice) =>
+    switch choice
+        "Tiny" => size.tiny
+        "Small" => size.small
+        "Normal" => size.normal
+        "Large" => size.large
+        => size.normal

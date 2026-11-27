@@ -1,0 +1,7 @@
+// Test library for test/imports.test.mjs (Atomik's own code).
+//@version=6
+// @description A base library that another test library imports.
+library("Base",
+     overlay = false)
+
+export double(float x) => x * 2

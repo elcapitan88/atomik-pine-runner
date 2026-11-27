@@ -1,0 +1,37 @@
+//@version=6
+indicator("jdehorty library parity", overlay=false)
+import jdehorty/MLExtensions/2 as ml
+import jdehorty/KernelFunctions/2 as kernels
+
+plot(ml.rescale(close, 19000, 21000, 0, 1), "rescale")
+plot(ml.normalize(close, 0, 1), "normalize_close")
+plot(ml.normalize(volume, -1, 1), "normalize_volume")
+plot(ml.normalizeDeriv(close, 10), "normalizeDeriv")
+plot(ml.tanh(ml.normalizeDeriv(close, 10)), "tanh")
+plot(ml.dualPoleFilter(close, 6), "dualPoleFilter")
+plot(ml.tanhTransform(close, 1, 5), "tanhTransform")
+plot(ml.n_rsi(close, 14, 1), "n_rsi")
+plot(ml.n_rsi(close, 9, 3), "n_rsi_9_3")
+plot(ml.n_cci(close, 20, 1), "n_cci")
+plot(ml.n_wt(hlc3, 10, 11), "n_wt")
+plot(ml.n_adx(high, low, close, 14), "n_adx")
+plot(ml.regime_filter(ohlc4, -0.1, true) ? 1 : 0, "regime_filter")
+plot(ml.filter_adx(close, 14, 20, true) ? 1 : 0, "filter_adx")
+plot(ml.filter_volatility(1, 10, true) ? 1 : 0, "filter_volatility")
+plot(kernels.rationalQuadratic(close, 8, 8.0, 25), "rationalQuadratic")
+plot(kernels.rationalQuadratic(close, 8, 1, 25), "rationalQuadratic_rw1")
+plot(kernels.gaussian(close, 6, 25), "gaussian")
+plot(kernels.periodic(close, 8, 100, 25), "periodic")
+plot(kernels.locallyPeriodic(close, 8, 24, 25), "locallyPeriodic")
+
+startLong = bar_index % 37 == 0
+endLong = bar_index % 37 == 20
+startShort = bar_index % 53 == 0
+endShort = bar_index % 53 == 30
+flip = bar_index % 5 == 0
+[tw, tl, flips, tt, hdr, wlr, wr] = ml.backtest(high, low, open, startLong, endLong, startShort, endShort, flip, 100, bar_index, close, false)
+plot(tw, "bt_wins")
+plot(tl, "bt_losses")
+plot(flips, "bt_flips")
+plot(tt, "bt_trades")
+plot(wr, "bt_winrate")
